@@ -51,19 +51,31 @@ NVCC_PATH = -L$(subst bin/nvcc,lib64,$(shell which nvcc | tr -s /))
 
 SOURCES = $(wildcard *.cu)
 OBJECTS = $(SOURCES:.cu=.o)
+HEADERS = ../common/*.h $(wildcard *.h)
+
+# Stamp file with the build settings: its timestamp changes only when its
+# content changes, so objects are rebuilt when a setting changes (make cannot
+# see command-line variables otherwise) and left alone when none did.
+FLAGS_STAMP = .build_flags
+BUILD_FLAGS = ARCH=$(ARCH) DUMMY=$(DUMMY) DEBUG=$(DEBUG) TOOL_FLAGS=$(TOOL_FLAGS) NVBIT_PATH=$(NVBIT_PATH) NVCC_VER=$(NVCC_VER) MAXRREGCOUNT_FLAG=$(MAXRREGCOUNT_FLAG)
 
 all: $(NVBIT_TOOL)
 
 $(NVBIT_TOOL): $(OBJECTS) $(NVBIT_PATH)/libnvbit.a
 	$(NVCC) -arch=$(ARCH) $(NVCC_OPT) $(OBJECTS) $(LIBS) $(NVCC_PATH) -lcuda -lcudart_static -shared -o $@
 
-%.o: %.cu ../common/*.h
+$(FLAGS_STAMP): FORCE
+	@echo '$(BUILD_FLAGS)' | cmp -s - $@ || echo '$(BUILD_FLAGS)' > $@
+
+%.o: %.cu $(HEADERS) $(FLAGS_STAMP)
 	$(NVCC) -dc -c -std=c++17 $(INCLUDES) $(TOOL_FLAGS) -Xptxas -cloning=no -Xcompiler -Wall -arch=$(ARCH) $(NVCC_OPT) -Xcompiler -fPIC $< -o $@
 
-inject_funcs.o: inject_funcs.cu ../common/*.h
+inject_funcs.o: inject_funcs.cu $(HEADERS) $(FLAGS_STAMP)
 	$(NVCC) $(INCLUDES) $(TOOL_FLAGS) $(MAXRREGCOUNT_FLAG) -Xptxas -astoolspatch --keep-device-functions -arch=$(ARCH) -DDUMMY=$(DUMMY) -Xcompiler -Wall -Xcompiler -fPIC -c $< -o $@
 
 clean:
-	rm -f *.so *.o
+	rm -f *.so *.o $(FLAGS_STAMP)
 
-.PHONY: all clean
+FORCE:
+
+.PHONY: all clean FORCE

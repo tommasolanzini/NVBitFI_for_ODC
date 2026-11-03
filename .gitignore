@@ -1,6 +1,7 @@
 # build artifacts
 *.o
 *.so
+.build_flags
 # campaign outputs
 logs/
 __pycache__/
