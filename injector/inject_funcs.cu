@@ -82,7 +82,7 @@ extern "C" __device__ __noinline__ void inject_select(uint64_t piinfo, uint64_t 
 	inj_info_t* inj_info = (inj_info_t*)piinfo;
 	uint64_t *counters = (uint64_t *)pcounters;
 
-	if (!inj_info->areParamsReady || inj_info->selected) return; // not the kernel of interest / already selected
+	if (!inj_info->areParamsReady) return; // not the kernel of interest (keep counting after the selection: groupInstrs must equal the profile)
 
 	// Same eligibility rules as the profiler (count_instrs)
 	const int igid = inj_info->groupID;

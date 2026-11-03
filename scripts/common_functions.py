@@ -108,6 +108,10 @@ def set_env(app, is_profiler):
 	os.environ['BIN_PATH'] = p.bin_dir[app]
 	os.environ['APP_DIR'] = p.app_dir[app]
 	os.environ['DATASET_DIR'] = p.app_data_dir[app]
+	# silence NVBit's banner and its nvbit_at_ctx_init() warning: they go to
+	# stdout/stderr and would make every run differ from the golden output
+	os.environ['NOBANNER'] = '1'
+	os.environ['ACK_CTX_INIT_LIMITATION'] = '1'
 	if is_profiler: 
 		os.environ['PRELOAD_FLAG'] = "LD_PRELOAD=" + p.PROFILER_LIB
 	else:
