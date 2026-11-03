@@ -25,7 +25,7 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 
-import os, sys, re, string, operator, math, datetime, time, signal, subprocess, shutil, glob, pkgutil, json
+import os, sys, re, string, operator, math, datetime, time, signal, subprocess, shutil, glob, json, importlib.util
 import params as p
 import common_functions as cf 
 
@@ -78,7 +78,7 @@ def record_result(inj_mode, igid, bfm, app, kname, kcount, iid, opid, bid, cat, 
 		print (result_str)
 
 	has_filelock = False
-	if pkgutil.find_loader('lockfile') is not None:
+	if importlib.util.find_spec('lockfile') is not None:
 		from lockfile import FileLock
 		has_filelock = True
 	

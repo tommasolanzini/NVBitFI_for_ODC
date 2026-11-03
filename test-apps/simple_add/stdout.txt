@@ -1,0 +1,4 @@
+Device 0 (NVIDIA RTX PRO 1000 Blackwell Generation Laptop GPU) is being used
+memory: 7.5251 GB ECC off 20 SMs x1627000
+#CTAs=10, nreps=10, threads/CTA=1024
+global sum = 102400 

@@ -26,7 +26,7 @@
 
 
 
-import os, sys, re, string, operator, math, datetime, subprocess, time, multiprocessing, pkgutil
+import os, sys, re, string, operator, math, datetime, subprocess, time, multiprocessing, importlib.util
 import params as p
 import common_functions as cf
 
@@ -161,7 +161,7 @@ def main():
 		where_to_run = sys.argv[1]
 	
 		if where_to_run != "standalone":
-			if pkgutil.find_loader('lockfile') is None:
+			if importlib.util.find_spec('lockfile') is None:
 				print ("lockfile module not found. This python module is needed to run injection experiments in parallel." )
 				sys.exit(-1)
 	

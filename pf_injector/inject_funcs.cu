@@ -28,7 +28,7 @@ extern "C" __device__ __noinline__ void inject_error(uint64_t piinfo, uint64_t p
 
 				if (!predicate) return; // instruction predicated out: it did not write its destination
 				inj_info_t* inj_info = (inj_info_t*)piinfo; 
-				uint32_t verbose_device = *((uint32_t *)pverbose_device);
+				(void)pverbose_device; // unused on the device
 
 				uint32_t smid;
 				asm("mov.u32 %0, %smid;" :"=r"(smid));
@@ -50,7 +50,6 @@ extern "C" __device__ __noinline__ void inject_error(uint64_t piinfo, uint64_t p
 								nvbit_write_reg(destGPRNum, injAfterVal);
 				}
 				// updating counter/flag to check whether the error was injected
-				if (verbose_device) printf("register=%d, before=0x%x, after=0x%x, expected_after=0x%x\n", destGPRNum, injBeforeVal, nvbit_read_reg(destGPRNum), injAfterVal);
 				inj_info->errorInjected = true; 
 				atomicAdd((unsigned long long*) &inj_info->injNumActivations, 1LL);  
 }

@@ -25,7 +25,7 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 
-import os, sys, re, string, math, datetime, time, pkgutil
+import os, sys, re, string, math, datetime, time
 import params as p
 import common_functions as cf 
 

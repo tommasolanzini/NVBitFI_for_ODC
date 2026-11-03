@@ -210,7 +210,5 @@ extern "C" __device__ __noinline__ void inject_error(uint64_t piinfo, uint64_t p
 	}
 	__threadfence();
 	inj_info->errorInjected = true;
-	if (verbose_device)
-		printf("NVBitFI: injected regType=%d reg=%d before=0x%x after=0x%x pc=0x%x tid=%d sm=%d\n",
-				inj_info->regType, inj_info->regNo, inj_info->beforeVal, inj_info->afterVal, offset, inj_info->tid, inj_info->smID);
+	// no device-side printf: it makes the tool fail to load with NVBit 1.8 on sm_120
 }
