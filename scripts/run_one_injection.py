@@ -300,6 +300,20 @@ def get_dmesg_delta(dm_before, dm_after):
 	return str(dm_after[pos+len(llb)+1:])
 
 ###############################################################################
+# Optional per-app ML features: <workload dir>/signature.py compares the outputs
+# in the current directory with the golden ones and prints one JSON object.
+###############################################################################
+def get_signature(app):
+	script = p.script_dir[app] + "/signature.py"
+	if not os.path.isfile(script):
+		return None
+	res = subprocess.run([sys.executable, script], stdout=subprocess.PIPE, universal_newlines=True)
+	if res.returncode != 0:
+		print ("signature.py failed for %s" %(app))
+		return None
+	return json.loads(res.stdout)
+
+###############################################################################
 # Run the actual injection run 
 ###############################################################################
 def run_one_injection_job(inj_mode, igid, bfm, app, kname, kcount, iid, opid, bid, icount):
@@ -351,6 +365,8 @@ def run_one_injection_job(inj_mode, igid, bfm, app, kname, kcount, iid, opid, bi
 		[value_str, pc, inst_type, tid, injBID] = get_inj_info()
 		ret_cat = classify_injection(app, igid, kname, kcount, iid, opid, bid, retcode, dmesg_delta)
 	
+	inj_log_record["signature"] = get_signature(app)
+
 	os.chdir(cwd) # return to the main dir
 	# print (ret_cat)
 

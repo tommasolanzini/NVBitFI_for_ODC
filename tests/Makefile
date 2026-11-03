@@ -9,6 +9,7 @@ dests_test: dests_test.cpp ../common/dests.h ../common/arch.h
 
 check: dests_test
 	./dests_test --check
+	python3 test_gemm_signature.py
 
 clean:
 	rm -f dests_test

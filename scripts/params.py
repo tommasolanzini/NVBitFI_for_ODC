@@ -230,6 +230,13 @@ apps = {
 			1, # expected runtime
 			"" # additional parameters to the run.sh
 		],
+	'gemm': [
+			NVBITFI_HOME + '/test-apps/gemm', # workload directory
+			'gemm', # binary name
+			NVBITFI_HOME + '/test-apps/gemm/', # path to the binary file
+			1, # expected runtime
+			"" # additional parameters to the run.sh
+		],
 }
 
 #########################################################################
