@@ -26,7 +26,7 @@
 
 
 
-import os, sys, re, string, operator, math, datetime, subprocess, time, multiprocessing, importlib.util
+import json, os, sys, re, string, operator, math, datetime, subprocess, time, multiprocessing, importlib.util
 import params as p
 import common_functions as cf
 
@@ -68,6 +68,15 @@ def clear_results_file(app):
 	for igid in p.inst_address_igid_bfm_map:
 		for bfm in p.inst_address_igid_bfm_map[igid]:
 			open(get_log_name(app, p.INST_ADDRESS_MODE, igid, bfm)).close()
+
+############################################################################
+# Injection indices already in the JSONL results of this group and model
+############################################################################
+def get_done_jobs(app, inj_mode, igid, bfm):
+	fname = p.app_log_dir[app] + "results-mode" + inj_mode + "-igid" + str(igid) + ".bfm" + str(bfm) + "." + str(p.NUM_INJECTIONS) + ".jsonl"
+	if not os.path.isfile(fname):
+		return set()
+	return {json.loads(line)["icount"] for line in open(fname)}
 
 ############################################################################
 # count how many jobs are done
@@ -112,12 +121,15 @@ def run_multiple_injections_igid(app, inj_mode, igid, where_to_run):
 	for bfm in bfm_list:
 		#print "App: %s, IGID: %s, EM: %s" %(app, p.IGID_STR[igid], p.EM_STR[bfm])
 		total_jobs = 0
+		done = get_done_jobs(app, inj_mode, igid, bfm)
 		inj_list_filenmae = p.app_log_dir[app] + "/injection-list/mode" + inj_mode + "-igid" + str(igid) + ".bfm" + str(bfm) + "." + str(p.NUM_INJECTIONS) + ".txt"
 		inf = open(inj_list_filenmae, "r")
 		for line in inf: # for each injection site 
 			total_jobs += 1
 			if total_jobs > p.THRESHOLD_JOBS: 
 				break; # no need to run more jobs
+			if total_jobs in done:
+				continue # already recorded: an interrupted campaign can be resumed
 			l = line.strip().split() #Example: _Z24bpnn_adjust_weights_cudaPfiS_iS_S_ 0 1297034 0.877316323856 0.214340876321
 			if len(l) >= 5: 
 				# print (line) 
@@ -147,7 +159,7 @@ def run_multiple_injections(app, inj_mode, where_to_run):
     else:
         igid_list = []
         if inj_mode == p.INST_VALUE_MODE:
-            igid_list = p.inst_value_igid_bfm_map
+            igid_list = p.igids_for_app(app)
         if inj_mode == p.INST_ADDRESS_MODE:
             igid_list = p.inst_address_igid_bfm_map
         for igid in igid_list: 

@@ -1,0 +1,6 @@
+sfu_math
+*.bin
+stdout.txt
+stderr.txt
+golden_stdout.txt
+golden_stderr.txt

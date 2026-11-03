@@ -70,7 +70,7 @@ NUM_INJECTIONS = 1000
 # THRESHOLD_JOBS = 384
 THRESHOLD_JOBS = 1000
 # THRESHOLD_JOBS = 1
-THRESHOLD_JOBS = 25
+# THRESHOLD_JOBS = 25
 
 # THRESHOLD_JOBS sould be <= NUM_INJECTIONS
 assert THRESHOLD_JOBS <= NUM_INJECTIONS
@@ -190,7 +190,13 @@ CAT_STR = ["Masked: Error was never read", "Masked: Write before read",
 # destinations (predicates) FLIP_SINGLE_BIT/FLIP_TWO_BITS invert the predicate,
 # RANDOM_VALUE writes a random 0/1 and ZERO_VALUE writes 0.
 inst_value_igid_bfm_map = {
-	G_GP: [FLIP_SINGLE_BIT]
+	G_GP: [FLIP_SINGLE_BIT],
+	G_PR: [FLIP_SINGLE_BIT],
+	G_TC: [FLIP_SINGLE_BIT],
+	G_UNIFORM: [FLIP_SINGLE_BIT],
+	G_SFU: [FLIP_SINGLE_BIT],
+	G_FP32: [FLIP_SINGLE_BIT],
+	G_LD: [FLIP_SINGLE_BIT],
 
 #  Examples
 # 	G_GP: [FLIP_SINGLE_BIT, FLIP_TWO_BITS, RANDOM_VALUE, ZERO_VALUE]
@@ -223,13 +229,6 @@ for _igid in inst_value_igid_bfm_map:
 # golden output files should also be in the workload directory
 #########################################################################
 apps = {
-	'simple_add': [
-			NVBITFI_HOME + '/test-apps/simple_add', # workload directory
-			'simple_add', # binary name
-			NVBITFI_HOME + '/test-apps/simple_add/', # path to the binary file
-			1, # expected runtime
-			"" # additional parameters to the run.sh
-		],
 	'gemm': [
 			NVBITFI_HOME + '/test-apps/gemm', # workload directory
 			'gemm', # binary name
@@ -237,7 +236,23 @@ apps = {
 			1, # expected runtime
 			"" # additional parameters to the run.sh
 		],
+	'sfu_math': [
+			NVBITFI_HOME + '/test-apps/sfu_math', # workload directory
+			'sfu_math', # binary name
+			NVBITFI_HOME + '/test-apps/sfu_math/', # path to the binary file
+			1, # expected runtime
+			"" # additional parameters to the run.sh
+		],
 }
+
+# Groups to inject per app (default: every group in inst_value_igid_bfm_map)
+app_igids = {
+	'gemm': [G_GP, G_PR, G_TC, G_UNIFORM, G_FP32, G_LD], # no SFU instructions
+	'sfu_math': [G_SFU], # the other groups are covered by gemm
+}
+
+def igids_for_app(app):
+	return [g for g in inst_value_igid_bfm_map if g in app_igids.get(app, inst_value_igid_bfm_map)]
 
 #########################################################################
 # Separate list of apps and error models for parsing because one may want to

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Offline test of test-apps/gemm/signature.py (no GPU needed)."""
+"""Offline test of scripts/fp_signature.py (no GPU needed)."""
 import math, os, struct, sys
 sys.dont_write_bytecode = True
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "test-apps", "gemm"))
-from signature import classify_pattern, compare
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts"))
+from fp_signature import classify_pattern, compare
 
 N = 8
 ONE = 0x3f800000

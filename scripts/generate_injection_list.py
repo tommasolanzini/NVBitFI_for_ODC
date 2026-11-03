@@ -75,7 +75,7 @@ def gen_lists(app, countList, inj_mode):
 		for bfm in p.rf_bfm_list:
 			write_injection_list_file(app, inj_mode, "rf", bfm, MAX_INJ, total_count, countList)
 	elif inj_mode == p.INST_VALUE_MODE: # instruction value injections
-		for igid in p.inst_value_igid_bfm_map:
+		for igid in p.igids_for_app(app):
 			for bfm in p.inst_value_igid_bfm_map[igid]: 
 				write_injection_list_file(app, inj_mode, igid, bfm, MAX_INJ, cf.get_group_count(countList, igid), countList)
 	elif inj_mode == p.INST_ADDRESS_MODE: # instruction value injections
@@ -96,7 +96,7 @@ def main():
 	inj_mode = "inst_value" # we only support inst_value mode in NVBitFI as of now (March 25, 2020)
 	
 	# actual code that generates list per app is here
-	for app in p.apps:
+	for app in (sys.argv[1:] or p.apps): # optional: only the apps named on the command line
 		print ("\nCreating list for %s ... " %(app))
 		os.system("mkdir -p %s/injection-list" %p.app_log_dir[app]) # create directory to store injection list
 	
