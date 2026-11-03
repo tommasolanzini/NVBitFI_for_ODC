@@ -165,7 +165,7 @@ def parse_results_apps(typ):
 def to_list(d, s):  
 	# if a specific category is not found then make it zero
 	l = []
-	for i in range(1,s-1):
+	for i in range(1,s): # categories are numbered 1 .. NUM_CATS-1
 		if i not in d:
 			d[i] = 0
 		l.append(d[i])

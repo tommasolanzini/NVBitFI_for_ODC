@@ -166,6 +166,17 @@ def read_inj_log():
 		info["errorInjected"] = "Error not injected" not in open(p.inj_run_log, "r").read()
 	return info
 
+# CUDA error string printed by the injector when a kernel fails ("" if none).
+# Also matches stdout, where the message is followed by "; ".
+def get_cuda_error(text):
+	m = re.search(r"ERROR FAIL in kernel execution \((.*)\)", text)
+	return m.group(1) if m else ""
+
+# Xid codes in a dmesg delta, in order and with repetitions, e.g. [13, 13, 13, 43].
+# Accepts "Xid (PCI:0000:01:00): 13," and the same text with ':' replaced by '-'.
+def get_xids(dmesg_delta):
+	return [int(x) for x in re.findall(r"Xid \([^)]*\)[:-] (\d+),", dmesg_delta)]
+
 ###############################################################################
 # Classify error injection result based on stdout, stderr, application output,
 # exit status, etc.
@@ -196,47 +207,44 @@ def classify_injection(app, igid, kname, kcount, iid, opid, bid, retcode, dmesg_
 		print (inj_log_str)
 		if p.verbose: print ("Error Not Injected: %s, %s, %s, %s, %s, %s" %(igid, kname, kcount, iid, opid, bid))
 		return p.OTHERS
+	# After the two checks above: a crash without an injection is not a result
+	# of the injection. Does not depend on dmesg, which may not be readable.
+	if get_cuda_error(inj_log_str) or get_cuda_error(stdout_str):
+		return p.KERNEL_CRASH
 	if "Error: misaligned address" in stdout_str: 
 		return p.STDOUT_ERROR_MESSAGE
 	if "Error: an illegal memory access was encountered" in stdout_str: 
 		return p.STDOUT_ERROR_MESSAGE
 	if "Error: misaligned address" in str(open(stderr_fname).read()): # if error is found in the log standard err 
 		return p.STDOUT_ERROR_MESSAGE
+	if retcode != 0:
+		return p.NON_ZERO_EC
 
 	os.system(p.script_dir[app] + "/sdc_check.sh") # perform SDC check
 
 	if os.path.isfile(p.output_diff_log) and os.path.isfile(p.stdout_diff_log) and os.path.isfile(p.stderr_diff_log):
 		if os.path.getsize(p.output_diff_log) == 0 and os.path.getsize(p.stdout_diff_log) == 0 and os.path.getsize(p.stderr_diff_log) == 0: # no diff is observed
-			if "ERROR FAIL in kernel execution" in inj_log_str: 
-				return p.MASKED_KERNEL_ERROR # masked_kernel_error
-			else:
-				if os.path.isfile(p.special_sdc_check_log):
-					if os.path.getsize(p.special_sdc_check_log) != 0:
-						if "Xid" in dmesg_delta:
-							return p.DMESG_APP_SPECIFIC_CHECK_FAIL
-						else:
-							return p.APP_SPECIFIC_CHECK_FAIL
-				return p.MASKED_OTHER # if not app specific error, mark it as masked
+			if os.path.isfile(p.special_sdc_check_log):
+				if os.path.getsize(p.special_sdc_check_log) != 0:
+					if "Xid" in dmesg_delta:
+						return p.DMESG_APP_SPECIFIC_CHECK_FAIL
+					else:
+						return p.APP_SPECIFIC_CHECK_FAIL
+			return p.MASKED_OTHER # if not app specific error, mark it as masked
 
 		if os.path.getsize(p.output_diff_log) != 0:
 			if "Xid" in dmesg_delta:
 				return p.DMESG_OUT_DIFF 
-			elif "ERROR FAIL in kernel execution" in inj_log_str: 
-				return p.SDC_KERNEL_ERROR
 			else:
 				return p.OUT_DIFF 
 		elif os.path.getsize(p.stdout_diff_log) != 0 and os.path.getsize(p.stderr_diff_log) == 0:
 			if "Xid" in dmesg_delta:
 				return p.DMESG_STDOUT_ONLY_DIFF
-			elif "ERROR FAIL in kernel execution" in inj_log_str: 
-				return p.SDC_KERNEL_ERROR
 			else:
 				return p.STDOUT_ONLY_DIFF
 		elif os.path.getsize(p.stderr_diff_log) != 0 and os.path.getsize(p.stdout_diff_log) == 0:
 			if "Xid" in dmesg_delta:
 				return p.DMESG_STDERR_ONLY_DIFF
-			elif "ERROR FAIL in kernel execution" in inj_log_str: 
-				return p.SDC_KERNEL_ERROR
 			else:
 				return p.STDERR_ONLY_DIFF
 		else:
@@ -333,6 +341,8 @@ def run_one_injection_job(inj_mode, igid, bfm, app, kname, kcount, iid, opid, bi
 		"tid": int(log.get("tid", -1)), "cta": int(log.get("ctaID", -1)), "sm": int(log.get("smID", -1)),
 		"warp_slot": int(log.get("warpID", -1)), "lane": int(log.get("laneID", -1)),
 		"group_instrs": int(log.get("groupInstrs", -1)), "ctas": int(log.get("ctas", -1)),
+		"exit_code": retcode, "xids": get_xids(dmesg_delta),
+		"cuda_error": get_cuda_error(open(p.inj_run_log).read() if os.path.isfile(p.inj_run_log) else "") or get_cuda_error(open(p.stdout_file).read() if os.path.isfile(p.stdout_file) else ""),
 	}
 	if timeout_flag:
 		[value_str, pc, inst_type, tid, injBID] = get_inj_info()

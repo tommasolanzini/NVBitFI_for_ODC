@@ -158,7 +158,10 @@ OUT_DIFF = 17
 APP_SPECIFIC_CHECK_FAIL= 18
 
 OTHERS = 19
-NUM_CATS = 20
+
+# Appended to keep the numbers above stable across campaigns
+KERNEL_CRASH = 20 # DUE: the CUDA runtime reported a kernel error
+NUM_CATS = 21
 
 CAT_STR = ["Masked: Error was never read", "Masked: Write before read",
 "Masked: other reasons", "DUE: Timeout", "DUE: Non Zero Exit Status", 
@@ -170,7 +173,7 @@ CAT_STR = ["Masked: Error was never read", "Masked: Write before read",
 "Pot DUE: App specific check failed, but dmesg recorded",
 "Pot DUE: Xid 43 recorded in dmesg",
 "SDC: Standard output is different", "SDC: Output file is different", 
-"SDC: App specific check failed", "Uncategorized"]
+"SDC: App specific check failed", "Uncategorized", "DUE: Kernel crash"]
 
 
 #########################################################################
