@@ -21,7 +21,7 @@ Main changes with respect to NVBitFI (tested with NVBit 1.5.5, Volta/Turing):
 | OS | Linux x86_64 (NVBit does not run on Windows; WSL is not supported) |
 | NVBit | 1.8 (`nvbit-Linux-x86_64-1.8.tar.bz2` from the NVBit releases) |
 | CUDA toolkit | 12.0 or newer; 12.8 or newer for sm_120 |
-| NVIDIA driver | **575.xx or older** (NVBit 1.8 requirement) |
+| NVIDIA driver | **580.xx or older** (NVBit 1.8 requirement) |
 | GCC | 8.5 or newer |
 
 ## Build
