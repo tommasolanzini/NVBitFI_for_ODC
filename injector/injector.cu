@@ -23,6 +23,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <assert.h>
+#include <string.h>
 #include <pthread.h>
 #include <string>
 #include <fstream>
@@ -54,6 +55,18 @@ pthread_mutex_t mutex;
 
 __managed__ inj_info_t inj_info;
 
+// Injection record in host-mapped pinned memory (see inj_shadow_t)
+static volatile inj_shadow_t *shadow = NULL;
+static void *shadow_device_ptr = NULL;
+
+// Everything the record needs from the host side, kept in plain host memory so
+// that write_inj_record() never touches managed memory on the crash paths.
+static bool target_launched = false; // the kernel selected for injection has been launched
+static int target_index = -1;
+static std::string target_kname;
+static int target_ctas = -1;
+static bool record_written = false;  // the log gets exactly one record
+
 void reset_inj_info() {
 	inj_info.areParamsReady = false;
 	inj_info.kernelName[0] = '\0';
@@ -67,41 +80,51 @@ void reset_inj_info() {
 	inj_info.selPcOffset = -1;
 	inj_info.selCtaFlat = -1;
 	inj_info.selTidInCta = -1;
-	inj_info.regType = -1;
-	inj_info.regNo = -1;
-	inj_info.mask = 0;
-	inj_info.beforeVal = 0;
-	inj_info.afterVal = 0;
-	inj_info.opcode = NOP;
-	inj_info.pcOffset = 0;
-	inj_info.tid = -1;
-	inj_info.ctaFlat = -1;
-	inj_info.smID = -1;
-	inj_info.warpID = -1;
-	inj_info.laneID = -1;
 	inj_info.errorInjected = false;
 	for (int i=0; i<NUM_DEBUG_VALS; i++) {
 		inj_info.debug[i] = -1;
 	}
 }
 
-void write_inj_info() {
+// Write the injection record to the log, once. Safe when the CUDA context is
+// dead or a kernel hangs: it only reads host memory. groupInstrs lives in
+// managed memory, so only the normal path passes it (< 0 = not available).
+void write_inj_record(long long groupInstrs) {
+	if (record_written) return; // e.g. a later kernel crashed after the record was written
+	record_written = true;
 	assert(fout.good());
+
+	if (target_launched) {
+		fout << "Injection data" << std::endl;
+		fout << "index: " << target_index << std::endl;
+		fout << "kernel_name: " << target_kname << std::endl;
+		fout << "ctas: " << target_ctas << std::endl;
+	}
 	// injectable instances of the selected group in this kernel (must match the profile)
-	fout << "groupInstrs: " << counters[NUM_OPCODE_COUNTERS + inj_info.groupID] << std::endl;
-	fout << "mask: 0x" << std::hex << inj_info.mask << std::endl;
-	fout << "beforeVal: 0x" << inj_info.beforeVal  << ";";
-	fout << "afterVal: 0x" << inj_info.afterVal << std::endl;
-	fout << std::dec;
-	fout << "regType: " << ((inj_info.regType >= 0 && inj_info.regType < NUM_REG_TYPES) ? regTypeNames[inj_info.regType] : "NONE") << std::endl;
-	fout << "regNo: " << inj_info.regNo << std::endl;
-	fout << "opcode: " << instTypeNames[inj_info.opcode] << std::endl;
-	fout << "pcOffset: 0x" << std::hex << inj_info.pcOffset << std::dec << std::endl;
-	fout << "tid: " << inj_info.tid << std::endl;
-	fout << "ctaID: " << inj_info.ctaFlat << std::endl;
-	fout << "smID: " << inj_info.smID << std::endl;
-	fout << "warpID: " << inj_info.warpID << std::endl;
-	fout << "laneID: " << inj_info.laneID << std::endl;
+	if (groupInstrs >= 0) fout << "groupInstrs: " << groupInstrs << std::endl;
+
+	const int state = shadow ? shadow->state : SHADOW_NONE;
+	if (state >= SHADOW_SELECTED) {
+		fout << "opcode: " << instTypeNames[shadow->opcode] << std::endl;
+		fout << "pcOffset: 0x" << std::hex << shadow->pcOffset << std::dec << std::endl;
+		fout << "tid: " << shadow->tid << std::endl;
+		fout << "ctaID: " << shadow->ctaFlat << std::endl;
+		fout << "smID: " << shadow->smID << std::endl;
+		fout << "warpID: " << shadow->warpID << std::endl;
+		fout << "laneID: " << shadow->laneID << std::endl;
+		const int regType = shadow->regType;
+		if (regType >= 0 && regType < NUM_REG_TYPES) {
+			fout << "mask: 0x" << std::hex << shadow->mask << std::endl;
+			fout << "beforeVal: 0x" << shadow->beforeVal << ";";
+			fout << "afterVal: 0x" << shadow->afterVal << std::dec << std::endl;
+			fout << "regType: " << regTypeNames[regType] << std::endl;
+			fout << "regNo: " << shadow->regNo << std::endl;
+		}
+	}
+	if (state != SHADOW_INJECTED) {
+		fout << "Error not injected\n";
+	}
+	fout.flush();
 }
 
 void print_inj_info() {
@@ -159,8 +182,8 @@ void INThandler(int sig) {
 	signal(sig, SIG_IGN); // disable Ctrl-C
 
 	fout << "ERROR FAIL Detected Signal SIGKILL\n";
-	write_inj_info();
-	exit(-1);
+	write_inj_record(-1);
+	_exit(-1); // not exit(): the CUDA teardown can block if a kernel is hanging
 }
 
 /* nvbit_at_init() is executed as soon as the nvbit tool is loaded. We typically
@@ -183,6 +206,31 @@ void nvbit_at_init() {
 
 	open_output_file(injOutputFilename);
 	if (verbose) printf("nvbit_at_init:end\n");
+}
+
+/* Called before the first kernel launch: the shadow record must exist when the
+ * kernel is instrumented, because its address is passed to the device calls. */
+void nvbit_tool_init(CUcontext ctx) {
+	if (shadow) return;
+	void *host_ptr = NULL;
+	if (cudaHostAlloc(&host_ptr, sizeof(inj_shadow_t), cudaHostAllocMapped) != cudaSuccess ||
+			cudaHostGetDevicePointer(&shadow_device_ptr, host_ptr, 0) != cudaSuccess) {
+		fprintf(stderr, "NVBitFI: cannot allocate the host-mapped injection record\n");
+		exit(1);
+	}
+	inj_shadow_t init = {};
+	init.state = SHADOW_NONE;
+	init.opcode = -1;
+	init.pcOffset = -1;
+	init.tid = -1;
+	init.ctaFlat = -1;
+	init.smID = -1;
+	init.warpID = -1;
+	init.laneID = -1;
+	init.regType = -1;
+	init.regNo = -1;
+	memcpy(host_ptr, &init, sizeof(init));
+	shadow = (volatile inj_shadow_t *)host_ptr;
 }
 
 // Does this instruction need to be instrumented for the selected group?
@@ -255,6 +303,7 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func) {
 			/* BEFORE: count injectable instances and select the target */
 			nvbit_insert_call(i, "inject_select", IPOINT_BEFORE);
 			nvbit_add_call_arg_const_val64(i, (uint64_t)&inj_info);
+			nvbit_add_call_arg_const_val64(i, (uint64_t)shadow_device_ptr);
 			nvbit_add_call_arg_const_val64(i, (uint64_t)counters);
 			nvbit_add_call_arg_const_val32(i, i->getOffset()); // offset (for pc) info
 			nvbit_add_call_arg_const_val32(i, si.opcode); // opcode info
@@ -265,6 +314,7 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func) {
 			/* AFTER: corrupt one destination of the selected instance */
 			nvbit_insert_call(i, "inject_error", IPOINT_AFTER);
 			nvbit_add_call_arg_const_val64(i, (uint64_t)&inj_info);
+			nvbit_add_call_arg_const_val64(i, (uint64_t)shadow_device_ptr);
 			nvbit_add_call_arg_const_val64(i, (uint64_t)&verbose_device);
 			nvbit_add_call_arg_const_val32(i, i->getOffset());
 			nvbit_add_call_arg_const_val32(i, pack_range(si.dests.gpr_base, si.dests.num_gpr));
@@ -304,6 +354,12 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
 			inj_info.selected = false;
 			inj_info.areParamsReady = (inj_info.kernelCount== kernel_id); // areParamsReady = true for the selected kernel
 			inj_info.debug[0] = -1; // set to 1 by the AFTER call when the instrumented kernel ran
+			if (inj_info.areParamsReady) {
+				target_launched = true;
+				target_index = kernel_id;
+				target_kname = removeSpaces(nvbit_get_func_name(ctx, func));
+				target_ctas = get_num_ctas(cbid, params);
+			}
 			if (verbose) printf("setting areParamsReady=%d, inj_info.kernelCount=%d, kernel_id=%d\n", inj_info.areParamsReady, inj_info.kernelCount, kernel_id);
 			cudaDeviceSynchronize();
 
@@ -317,29 +373,19 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
 			if ( cudaSuccess != le ) {
 				assert(fout.good());
 				std::cout << "ERROR FAIL in kernel execution (" << cudaGetErrorString(le) << "); ";
-				fout << "ERROR FAIL in kernel execution (" << cudaGetErrorString(le) << "); ";
-				fout.flush();
-				exit(1); // let's exit early because no error was injected
+				fout << "ERROR FAIL in kernel execution (" << cudaGetErrorString(le) << ")" << std::endl;
+				write_inj_record(-1); // the context is dead: host memory only
+				exit(1);
 			}
 
 			std::string kname = removeSpaces(nvbit_get_func_name(ctx,func));
 			if (inj_info.areParamsReady) {
 				inj_info.areParamsReady = false;
-				int num_ctas = get_num_ctas(cbid, params);
-				assert(fout.good());
-				fout << "Injection data" << std::endl;
-				fout << "index: " << kernel_id << std::endl;
-				fout << "kernel_name: " << kname  << std::endl;
-				fout << "ctas: " << num_ctas << std::endl;
-				write_inj_info();
-
-				if (!inj_info.errorInjected) {
-					fout << "Error not injected\n";
-				}
+				write_inj_record(counters[NUM_OPCODE_COUNTERS + inj_info.groupID]);
 
 				// sanity check of the NVBit register read path (TOOL_VERBOSE=1):
 				// the value NVBit passes as argument must equal nvbit_read_reg()
-				if (verbose != 0 && inj_info.regType == REG_GPR && inj_info.debug[1] != inj_info.debug[2]) {
+				if (verbose != 0 && shadow->regType == REG_GPR && inj_info.debug[1] != inj_info.debug[2]) {
 					fout << "ERROR FAIL in kernel execution; Expected reg value doesn't match; \n";
 					fout << "reg: R" << inj_info.debug[3] << ", expected_val: " << std::hex << inj_info.debug[1]
 						<< ", nvbit_read_reg: " << inj_info.debug[2] << std::dec << "\n";
@@ -356,4 +402,12 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
 	}
 }
 
-void nvbit_at_term() { } // nothing to do here.
+/* No record yet at normal termination: the selected kernel never completed
+ * (e.g. wrong kernel count). Without this line such a run looks masked. The
+ * shadow is not read here: no GPU resource is guaranteed to exist any more. */
+void nvbit_at_term() {
+	if (!record_written) {
+		record_written = true;
+		fout << "Error not injected" << std::endl;
+	}
+}

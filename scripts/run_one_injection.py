@@ -271,9 +271,13 @@ def is_timeout(app, pr): # check if the process is active every 'factor' sec for
 		time.sleep(factor)
 
 	if to_th <= 0: # (to_th is a float: "== 0" could be skipped)
-		os.killpg(pr.pid, signal.SIGINT) # pr.kill()
+		os.killpg(pr.pid, signal.SIGINT) # the injector writes its record on SIGINT
 		print ("timeout")
-		return [True, pr.poll()]
+		try:
+			return [True, pr.wait(timeout=5)] # the record must be on disk before the log is parsed
+		except subprocess.TimeoutExpired:
+			os.killpg(pr.pid, signal.SIGKILL)
+			return [True, pr.wait()]
 	else:
 		return [False, retcode]
 

@@ -74,10 +74,22 @@ __inline__ __device__ int nth_set_bit(uint32_t mask, int k) {
 	return -1;
 }
 
+// Store what is about to be injected in host memory before the register is
+// corrupted, so that the record survives whatever the corruption causes.
+__inline__ __device__ void record_injection(volatile inj_shadow_t *rec, int regType, int regNo,
+		unsigned int mask, unsigned int before, unsigned int after) {
+	rec->regType = regType;
+	rec->regNo = regNo;
+	rec->mask = mask;
+	rec->beforeVal = before;
+	rec->afterVal = after;
+	__threadfence_system();
+}
+
 // ---------------------------------------------------------------------------
 // BEFORE: count and select
 // ---------------------------------------------------------------------------
-extern "C" __device__ __noinline__ void inject_select(uint64_t piinfo, uint64_t pcounters,
+extern "C" __device__ __noinline__ void inject_select(uint64_t piinfo, uint64_t pshadow, uint64_t pcounters,
 		int offset, int opcode, int grp, int flags, int predicate) {
 	inj_info_t* inj_info = (inj_info_t*)piinfo;
 	uint64_t *counters = (uint64_t *)pcounters;
@@ -112,10 +124,21 @@ extern "C" __device__ __noinline__ void inject_select(uint64_t piinfo, uint64_t 
 	const unsigned long long myIdx = base + (uniform ? 0 : __popc(pred_mask & ((1u << lane) - 1)));
 
 	if (myIdx == inj_info->instID) {
+		volatile inj_shadow_t *rec = (volatile inj_shadow_t *)pshadow;
+		rec->opcode = opcode;
+		rec->pcOffset = offset;
+		rec->tid = get_flat_tid();
+		rec->ctaFlat = get_flat_cta();
+		rec->smID = get_smid();
+		rec->warpID = get_warpid();
+		rec->laneID = lane;
+		__threadfence_system(); // the fields must reach host memory before the state
+		rec->state = SHADOW_SELECTED;
+		__threadfence_system();
+
 		inj_info->selPcOffset = offset;
 		inj_info->selCtaFlat = get_flat_cta();
 		inj_info->selTidInCta = get_flat_tid_in_cta();
-		inj_info->opcode = opcode;
 		__threadfence();
 		inj_info->selected = true;
 	}
@@ -124,9 +147,10 @@ extern "C" __device__ __noinline__ void inject_select(uint64_t piinfo, uint64_t 
 // ---------------------------------------------------------------------------
 // AFTER: corrupt one destination of the selected instance
 // ---------------------------------------------------------------------------
-extern "C" __device__ __noinline__ void inject_error(uint64_t piinfo, uint64_t pverbose_device,
+extern "C" __device__ __noinline__ void inject_error(uint64_t piinfo, uint64_t pshadow, uint64_t pverbose_device,
 		int offset, uint32_t gprRange, uint32_t prMask, uint32_t urRange, uint32_t upMask, int regval) {
 	inj_info_t* inj_info = (inj_info_t*)piinfo;
+	volatile inj_shadow_t *rec = (volatile inj_shadow_t *)pshadow;
 	uint32_t verbose_device = *((uint32_t *)pverbose_device);
 
 	if (!inj_info->selected || inj_info->errorInjected) return;
@@ -143,17 +167,10 @@ extern "C" __device__ __noinline__ void inject_error(uint64_t piinfo, uint64_t p
 	else if (igid == G_GPPR) { candU = 0; candUP = 0; }
 	const int total = candG + candP + candU + candUP;
 
-	inj_info->pcOffset = offset;
-	inj_info->tid = get_flat_tid();
-	inj_info->ctaFlat = get_flat_cta();
-	inj_info->smID = get_smid();
-	inj_info->warpID = get_warpid();
-	inj_info->laneID = get_laneid();
 	inj_info->debug[0] = 1;
 
 	if (total == 0) { // should not happen: eligibility guarantees a destination
-		inj_info->regType = -1;
-		inj_info->errorInjected = true;
+		inj_info->errorInjected = true; // the record stays SHADOW_SELECTED: nothing injected
 		return;
 	}
 
@@ -168,47 +185,34 @@ extern "C" __device__ __noinline__ void inject_error(uint64_t piinfo, uint64_t p
 		}
 		unsigned int before = nvbit_read_reg((uint64_t)r);
 		unsigned int mask = get_mask(inj_info->bitFlipModel, inj_info->bitIDSeed, before);
-		inj_info->regType = REG_GPR;
-		inj_info->regNo = r;
-		inj_info->beforeVal = before;
-		inj_info->mask = mask;
-		inj_info->afterVal = DUMMY ? before : (before ^ mask);
-		if (!DUMMY) nvbit_write_reg((uint64_t)r, inj_info->afterVal);
+		unsigned int after = DUMMY ? before : (before ^ mask);
+		record_injection(rec, REG_GPR, r, mask, before, after);
+		if (!DUMMY) nvbit_write_reg((uint64_t)r, after);
 	} else if ((d -= candG) < candP) {                 // ---- predicate P0-P6 ----
 		int p = nth_set_bit(prMask, d);
 		unsigned int before = (unsigned int)nvbit_read_pred_reg();
 		unsigned int bit = corrupt_pred_bit(inj_info->bitFlipModel, inj_info->bitIDSeed, (before >> p) & 1u);
 		unsigned int after = (before & ~(1u << p)) | (bit << p);
-		inj_info->regType = REG_PR;
-		inj_info->regNo = p;
-		inj_info->beforeVal = before;
-		inj_info->mask = before ^ after;
-		inj_info->afterVal = DUMMY ? before : after;
+		record_injection(rec, REG_PR, p, before ^ after, before, DUMMY ? before : after);
 		if (!DUMMY) nvbit_write_pred_reg((int32_t)after);
 	} else if ((d -= candP) < candU) {                 // ---- uniform register ----
 		int r = uBase + d;
 		unsigned int before = nvbit_read_ureg((uint64_t)r);
 		unsigned int mask = get_mask(inj_info->bitFlipModel, inj_info->bitIDSeed, before);
-		inj_info->regType = REG_UR;
-		inj_info->regNo = r;
-		inj_info->beforeVal = before;
-		inj_info->mask = mask;
-		inj_info->afterVal = DUMMY ? before : (before ^ mask);
-		if (!DUMMY) nvbit_write_ureg((uint64_t)r, inj_info->afterVal);
+		unsigned int after = DUMMY ? before : (before ^ mask);
+		record_injection(rec, REG_UR, r, mask, before, after);
+		if (!DUMMY) nvbit_write_ureg((uint64_t)r, after);
 	} else {                                           // ---- uniform predicate UP0-UP6 ----
 		d -= candU;
 		int p = nth_set_bit(upMask, d);
 		unsigned int before = (unsigned int)nvbit_read_upred_reg();
 		unsigned int bit = corrupt_pred_bit(inj_info->bitFlipModel, inj_info->bitIDSeed, (before >> p) & 1u);
 		unsigned int after = (before & ~(1u << p)) | (bit << p);
-		inj_info->regType = REG_UP;
-		inj_info->regNo = p;
-		inj_info->beforeVal = before;
-		inj_info->mask = before ^ after;
-		inj_info->afterVal = DUMMY ? before : after;
+		record_injection(rec, REG_UP, p, before ^ after, before, DUMMY ? before : after);
 		if (!DUMMY) nvbit_write_upred_reg((int32_t)after);
 	}
-	__threadfence();
+	rec->state = SHADOW_INJECTED;
+	__threadfence_system();
 	inj_info->errorInjected = true;
 	// no device-side printf: it makes the tool fail to load with NVBit 1.8 on sm_120
 }
