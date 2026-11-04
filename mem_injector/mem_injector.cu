@@ -1,9 +1,12 @@
 /*
- * NVBitFI_for_ODC (2026): memory-data injector, global memory.
+ * NVBitFI_for_ODC (2026): memory-data injector, global and shared memory.
  *
- * Corrupts one bit of a live allocation where it is stored, between kernels
- * (timing mode a, host read-XOR-write) or during a kernel (timing mode b,
- * atomicXor at the N-th dynamic instruction). See README.md.
+ * Global memory: corrupts one bit of a live allocation where it is stored,
+ * between kernels (timing mode a, host read-XOR-write) or during a kernel
+ * (timing mode b, atomicXor at the N-th dynamic instruction).
+ * Shared memory: corrupts one bit of the window of a CTA with atomicXor, right
+ * after the N-th dynamic store (mode s) or on a sampled SM, offset and time
+ * (mode u). See README.md.
  *
  * MEMINJ_PHASE selects what the tool does:
  *   timing: no instrumentation, log the CUDA events with their times
@@ -47,6 +50,7 @@ enum EventKind { EV_NONE, EV_KERNEL, EV_ALLOC, EV_FREE, EV_H2D, EV_D2H, EV_D2D, 
 static const char *event_names[] = {"none", "kernel", "alloc", "free", "h2d", "d2h", "d2d", "memset"};
 
 __managed__ mem_info_t info;
+__managed__ mem_cta_t cta_table[MEM_MAX_CTAS];
 
 static pthread_mutex_t mutex = PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP;
 static thread_local bool in_tool = false; // CUDA calls made by the tool itself are not events
@@ -59,7 +63,7 @@ static std::vector<Buffer> buffers; // in allocation order: ids are stable acros
 
 // Target of the injection (inject phase)
 static struct {
-	std::string mode;        // "a" = between kernels, "b" = during a kernel
+	std::string mode;        // "a" = between kernels, "b" = during a kernel, "s" = after a shared store, "u" = uniform in shared memory
 	int bufferId = -1;
 	size_t bufferSize = 0;
 	size_t offset = 0;       // of the 32-bit word
@@ -67,8 +71,14 @@ static struct {
 	long long event = -1;    // mode a: flip on entry of this event
 	int kernel = -1;         // mode b: flip in this kernel
 	std::string kernelName;
-	unsigned long long instID = 0;
+	unsigned long long instID = 0; // mode s: index among the shared stores
+	int sm = -1;             // mode u
+	unsigned shmOffset = 0;  // mode u: word in the window of the CTA
 } target;
+
+static bool is_shared_mode() { return target.mode == "s" || target.mode == "u"; }
+
+static int unseen_shared_instrs = 0; // instructions that may reach shared memory without being traced
 
 static bool flip_done = false;      // host view: flip applied (mode a) or kernel of the flip started (mode b)
 static uint64_t flip_byte = 0;
@@ -125,7 +135,16 @@ static void take_snapshot() {
 static void write_record(const mem_shadow_t &r) {
 	if (record_written || phase != PHASE_INJECT) return;
 	record_written = true;
+	fout << "structure: " << (is_shared_mode() ? "shared" : "global") << "\n";
 	fout << "mode: " << target.mode << "\n";
+	if (is_shared_mode()) {
+		fout << "targetSM: " << target.sm << "\n";
+		fout << "unseenSharedInstrs: " << unseen_shared_instrs << "\n";
+		if (r.state >= MEM_SELECTED) {
+			fout << "shmWordOffset: " << r.shmWordOffset << "\n";
+			fout << "shmMask: 0x" << std::hex << r.shmMask << std::dec << "\n";
+		}
+	}
 	fout << "bufferId: " << target.bufferId << "\n";
 	fout << "bufferSize: " << target.bufferSize << "\n";
 	fout << "offset: " << target.offset << "\n";
@@ -189,10 +208,13 @@ static void parse_target() {
 		else if (key == "kernel") ifs >> target.kernel;
 		else if (key == "kernel_name") ifs >> target.kernelName;
 		else if (key == "inst") ifs >> target.instID;
+		else if (key == "sm") ifs >> target.sm;
+		else if (key == "shm_offset") ifs >> target.shmOffset;
 		else { printf("mem_injector: unknown key %s\n", key.c_str()); exit(1); }
 	}
-	assert(target.mode == "a" || target.mode == "b");
-	assert(target.offset % 4 == 0 && target.bit >= 0 && target.bit < 32);
+	assert(target.mode == "a" || target.mode == "b" || is_shared_mode());
+	assert(target.offset % 4 == 0 && target.shmOffset % 4 == 0 && target.bit >= 0);
+	assert(target.mode == "s" || target.bit < 32); // in mode s it only picks a bit of the stored bytes
 }
 
 void nvbit_at_init() {
@@ -251,6 +273,69 @@ static void host_flip() {
 
 static std::unordered_set<CUfunction> already_instrumented;
 
+static bool is_shared_store(Instr *i) {
+	return i->getMemorySpace() == InstrType::MemorySpace::SHARED && i->isStore() && !i->isLoad();
+}
+
+static void add_shared_trace_call(Instr *i) {
+	const InstrType::MemorySpace s = i->getMemorySpace();
+	if (s == InstrType::MemorySpace::GENERIC || s == InstrType::MemorySpace::GLOBAL_TO_SHARED || s == InstrType::MemorySpace::DISTRIBUTED_SHARED) {
+		unseen_shared_instrs++;
+		return;
+	}
+	if (s != InstrType::MemorySpace::SHARED) return;
+	const int flags = (i->isLoad() ? MEM_FLAG_LOAD : 0) | (i->isStore() ? MEM_FLAG_STORE : 0);
+	if (!flags) return;
+	nvbit_insert_call(i, "shm_trace_access", IPOINT_BEFORE);
+	nvbit_add_call_arg_const_val64(i, (uint64_t)&info);
+	nvbit_add_call_arg_const_val64(i, (uint64_t)shadow_device_ptr);
+	nvbit_add_call_arg_guard_pred_val(i);
+	nvbit_add_call_arg_mref_addr64(i, 0);
+	nvbit_add_call_arg_const_val32(i, std::max(i->getSize(), 1));
+	nvbit_add_call_arg_const_val32(i, flags);
+	if (flags == MEM_FLAG_STORE) {
+		nvbit_insert_call(i, "shm_trace_store_after", IPOINT_AFTER);
+		nvbit_add_call_arg_const_val64(i, (uint64_t)&info);
+		nvbit_add_call_arg_const_val64(i, (uint64_t)shadow_device_ptr);
+		nvbit_add_call_arg_guard_pred_val(i);
+		nvbit_add_call_arg_mref_addr64(i, 0);
+		nvbit_add_call_arg_const_val32(i, std::max(i->getSize(), 1));
+	}
+}
+
+static void add_flip_after_store(Instr *i) {
+	nvbit_insert_call(i, "shm_flip_after_store", IPOINT_AFTER);
+	nvbit_add_call_arg_const_val64(i, (uint64_t)&info);
+	nvbit_add_call_arg_const_val64(i, (uint64_t)shadow_device_ptr);
+	nvbit_add_call_arg_const_val64(i, (uint64_t)&counters[0]);
+	nvbit_add_call_arg_const_val32(i, i->getOffset());
+	nvbit_add_call_arg_guard_pred_val(i);
+	nvbit_add_call_arg_mref_addr64(i, 0);
+	nvbit_add_call_arg_const_val32(i, std::max(i->getSize(), 1));
+}
+
+static void add_flip_uniform(Instr *i) {
+	nvbit_insert_call(i, "shm_flip_uniform", IPOINT_BEFORE);
+	nvbit_add_call_arg_const_val64(i, (uint64_t)&info);
+	nvbit_add_call_arg_const_val64(i, (uint64_t)shadow_device_ptr);
+	nvbit_add_call_arg_const_val64(i, (uint64_t)&counters[0]);
+	nvbit_add_call_arg_const_val32(i, i->getOffset());
+	nvbit_add_call_arg_guard_pred_val(i);
+}
+
+// Count phase: stores to shared memory in counters[1], residency of the CTAs
+static void add_profile_calls(Instr *i) {
+	nvbit_insert_call(i, "shm_residency", IPOINT_BEFORE);
+	nvbit_add_call_arg_const_val64(i, (uint64_t)&cta_table[0]);
+	nvbit_add_call_arg_const_val64(i, (uint64_t)&counters[0]);
+	nvbit_add_call_arg_guard_pred_val(i);
+	if (is_shared_store(i)) {
+		nvbit_insert_call(i, "shm_count_store", IPOINT_BEFORE);
+		nvbit_add_call_arg_const_val64(i, (uint64_t)&counters[1]);
+		nvbit_add_call_arg_guard_pred_val(i);
+	}
+}
+
 static void add_trace_call(Instr *i) {
 	const InstrType::MemorySpace s = i->getMemorySpace();
 	if (s != InstrType::MemorySpace::GLOBAL && s != InstrType::MemorySpace::GENERIC) return;
@@ -285,8 +370,20 @@ static void instrument(CUcontext ctx, CUfunction func) {
 		if (!already_instrumented.insert(f).second) continue;
 		for (auto i : nvbit_get_instrs(ctx, f)) {
 			// every kernel can be the target: the armed flag decides at run time
-			add_count_call(i);
-			if (phase == PHASE_INJECT) add_trace_call(i);
+			if (phase == PHASE_COUNT) {
+				add_count_call(i);
+				add_profile_calls(i);
+			} else if (target.mode == "u") {
+				add_flip_uniform(i);
+				add_shared_trace_call(i);
+			} else if (target.mode == "s") {
+				// this order: the store that triggers the flip must not look ambiguous
+				add_shared_trace_call(i);
+				if (is_shared_store(i)) add_flip_after_store(i);
+			} else {
+				add_count_call(i);
+				add_trace_call(i);
+			}
 		}
 	}
 }
@@ -296,6 +393,19 @@ static void sync_info(bool arm) {
 	cudaDeviceSynchronize();
 	info.armed = arm;
 	info.kernelIdx = kernel_id;
+	if (is_shared_mode()) {
+		// the window of a CTA does not outlive the kernel: trace only this one
+		info.traceOn = arm;
+		if (arm) {
+			info.instID = target.instID;
+			info.targetSM = target.sm;
+			info.bitSeed = target.bit;
+			info.flipOffsetTarget = target.shmOffset;
+			info.applyFlip = DUMMY ? 0 : 1;
+		}
+		cudaDeviceSynchronize();
+		return;
+	}
 	if (word_addr) {
 		info.wordAddr = word_addr;
 		info.flipByteAddr = flip_byte;
@@ -323,14 +433,15 @@ static void on_kernel_entry(CUcontext ctx, nvbit_api_cuda_t cbid, void *params) 
 	instrument(ctx, func);
 	cudaDeviceSynchronize();
 	init_counters();
+	if (phase == PHASE_COUNT) memset((void *)cta_table, 0, sizeof(cta_table));
 
 	bool arm = false;
 	if (phase == PHASE_COUNT) {
 		info.instID = ~0ull; // never reached: only count
 		arm = true;
-	} else if (target.mode == "b" && kernel_id == target.kernel && !flip_done) {
+	} else if (target.mode != "a" && kernel_id == target.kernel && !flip_done) {
 		std::string launched = removeSpaces(nvbit_get_func_name(ctx, func));
-		if (launched == target.kernelName && resolve_target()) {
+		if (launched == target.kernelName && (is_shared_mode() || resolve_target())) {
 			arm = true;
 			flip_done = true;
 		}
@@ -369,7 +480,23 @@ static void on_kernel_exit(CUcontext ctx, nvbit_api_cuda_t cbid, void *params) {
 	}
 	std::string extra = ", \"k\": " + std::to_string(kernel_id) + ", \"name\": \"" +
 		removeSpaces(nvbit_get_func_name(ctx, func)) + "\"";
-	if (phase == PHASE_COUNT) extra += ", \"instrs\": " + std::to_string(counters[0]);
+	if (phase == PHASE_COUNT) {
+		extra += ", \"instrs\": " + std::to_string(counters[0]);
+		func_config_t cfg;
+		nvbit_get_func_config(ctx, func, &cfg);
+		const unsigned shm = cfg.shmem_static_nbytes + cfg.shmem_dynamic_nbytes;
+		if (shm) {
+			extra += ", \"shm\": " + std::to_string(shm) + ", \"stores\": " + std::to_string(counters[1]) + ", \"ctas\": [";
+			bool first = true;
+			for (int c = 0; c < MEM_MAX_CTAS; c++) {
+				if (!cta_table[c].first) continue;
+				extra += std::string(first ? "" : ", ") + "[" + std::to_string(cta_table[c].sm) + ", " +
+					std::to_string(cta_table[c].first) + ", " + std::to_string(cta_table[c].last) + "]";
+				first = false;
+			}
+			extra += "]";
+		}
+	}
 	log_event(EV_KERNEL, t1, extra);
 	kernel_id++;
 }

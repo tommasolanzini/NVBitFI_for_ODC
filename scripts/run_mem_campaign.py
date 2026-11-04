@@ -3,8 +3,8 @@
 # their configuration go in one directory, as for the other campaigns.
 #
 #   run_mem_campaign.py profile <app> <dir>
-#   run_mem_campaign.py list <app> <dir> --mode a|b -n N --seed S
-#   run_mem_campaign.py run <app> <dir> --mode a|b
+#   run_mem_campaign.py list <app> <dir> --mode a|b|s|u -n N --seed S
+#   run_mem_campaign.py run <app> <dir> --mode a|b|s|u
 #   run_mem_campaign.py one <app> <dir> <file with one target as JSON>
 #
 # Reuses the classification of run_one_injection.py, so that the outcomes mean
@@ -51,6 +51,10 @@ def cmd_profile(a, base):
 	x = mp.exposure(events)
 	json.dump(x, open(base + "/exposure.json", "w"), indent=1)
 	print(json.dumps(x, indent=1))
+	if mp.kernels_with_shm(events):
+		x = mp.shared_exposure(events)
+		json.dump(x, open(base + "/exposure-shared.json", "w"), indent=1)
+		print(json.dumps(x, indent=1))
 	for b in mp.buffers_of(events).values():
 		print("buffer", b)
 
@@ -62,7 +66,13 @@ def list_path(base, mode):
 def cmd_list(a, base):
 	events = json.load(open(base + "/mem-profile.json"))
 	with open(list_path(base, a.mode), "w") as f:
-		for i, t in enumerate(mp.sample_targets(events, a.mode, a.n, a.seed), 1):
+		if a.mode == mp.MODE_UNIFORM:
+			targets = mp.sample_uniform(events, a.n, a.seed)
+		elif a.mode == mp.MODE_AFTER_STORE:
+			targets = mp.sample_after_store(events, a.n, a.seed)
+		else:
+			targets = mp.sample_targets(events, a.mode, a.n, a.seed)
+		for i, t in enumerate(targets, 1):
 			t["icount"] = i
 			t["seed"] = a.seed
 			f.write(json.dumps(t) + "\n")
@@ -76,8 +86,8 @@ def to_int(v, default=-1):
 
 
 def record_from_log(log):
-	return {
-		"structure": "global", "timing_mode": log.get("mode", ""),
+	r = {
+		"structure": log.get("structure", ""), "timing_mode": log.get("mode", ""),
 		"buffer": to_int(log.get("bufferId")), "buffer_size": to_int(log.get("bufferSize")),
 		"offset": to_int(log.get("offset")), "bit": to_int(log.get("bit")),
 		"old_word": log.get("oldWord", ""), "new_word": log.get("newWord", ""),
@@ -93,6 +103,13 @@ def record_from_log(log):
 		"read_kernels": mp.kernels_from_mask(to_int(log.get("readKernels"), 0)),
 		"injected": bool(log.get("errorInjected", False)) and "newWord" in log,
 	}
+	if r["structure"] == "shared":
+		# offset and bit actually flipped: in mode s the thread picks them
+		mask = to_int(log.get("shmMask"), 0)
+		r.update({"target_sm": to_int(log.get("targetSM")), "offset": to_int(log.get("shmWordOffset")),
+			"bit": mask.bit_length() - 1 if mask else -1, "buffer": -1, "buffer_size": -1,
+			"unseen_shared_instrs": to_int(log.get("unseenSharedInstrs"), 0)})
+	return r
 
 
 def run_target(a, base, t, out_name):
@@ -129,7 +146,7 @@ def run_target(a, base, t, out_name):
 	os.chdir(cwd)
 	with open(base + "/" + out_name, "a") as f:
 		f.write(json.dumps(rec) + "\n")
-	print("icount=%s mode=%s buffer=%d offset=%d bit=%d outcome=%s reads old/new/all=%d/%d/%d host=%d first=%d subclass=%s" % (icount, t["mode"], t["buffer"], t["offset"], t["bit"],
+	print("icount=%s mode=%s buffer=%d offset=%d bit=%d sm=%d cta=%d outcome=%s reads old/new/all=%d/%d/%d host=%d first=%d subclass=%s" % (icount, t["mode"], rec["buffer"], rec["offset"], rec["bit"], rec["sm"], rec["cta"],
 		p.CAT_STR[cat - 1], rec["reads_old"], rec["reads_new"], rec["loads"], rec["host_reads"], rec["first_access"], rec["masked_subclass"]))
 	time.sleep(0.2)
 
@@ -157,7 +174,7 @@ def main():
 	ap.add_argument("app")
 	ap.add_argument("dir")
 	ap.add_argument("target", nargs="?")
-	ap.add_argument("--mode", choices=["a", "b"])
+	ap.add_argument("--mode", choices=["a", "b", "s", "u"])
 	ap.add_argument("-n", type=int, default=100)
 	ap.add_argument("--seed", type=int, default=1)
 	a = ap.parse_args()

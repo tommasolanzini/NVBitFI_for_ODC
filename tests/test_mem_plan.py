@@ -88,5 +88,48 @@ check("one new read is enough", mp.masked_subclass(R(first_access=1, reads_old=9
 check("host read", mp.masked_subclass(R(first_access=1, host_reads=1)), "read_masked")
 check("kernels mask", mp.kernels_from_mask(0b101), [0, 2])
 
+# ---- shared memory ----
+check("subclass ambiguous", mp.masked_subclass({"reads_new": 0, "reads_old": 0, "host_reads": 0, "first_access": mp.ACCESS_AMBIGUOUS}), "ambiguous")
+# Two kernels with shared memory on two SMs. Clock: instrs; t1-t0 = 1000 ns.
+SH = [
+	{"e": 0, "kind": "alloc", "t0": 0, "t1": 10, "id": 0, "size": 100},
+	{"e": 1, "kind": "kernel", "t0": 1000, "t1": 2000, "k": 0, "name": "k0", "instrs": 100, "shm": 400, "stores": 10,
+		"ctas": [[3, 1, 51], [3, 26, 101], [7, 51, 101]]},
+	{"e": 2, "kind": "kernel", "t0": 3000, "t1": 4000, "k": 1, "name": "plain", "instrs": 100},
+	{"e": 3, "kind": "term", "t0": 10000, "t1": 10000},
+]
+check("kernels with shm", [k["k"] for k in mp.kernels_with_shm(SH)], [0])
+check("cta time", mp.cta_seconds_ns(SH[1], SH[1]["ctas"][0]), 500.0)
+check("peak per sm", mp.peak_ctas_per_sm(SH[1]), {3: 2, 7: 1})
+x = mp.shared_exposure(SH)
+resident_ns = 500 + 750 + 500
+check("windows", abs(x["windows"] - 400 * 8 * resident_ns * 1e-9) < 1e-12, True)
+check("reserved", abs(x["reserved"] - 1024 * 8 * resident_ns * 1e-9) < 1e-12, True)
+check("peak", x["peak_ctas_on_one_sm"], 2)
+check("run", abs(x["run_seconds"] - 1e-5) < 1e-15, True)
+check("exposure adds up", abs(x["windows"] + x["reserved"] + x["free"] + x["not_usable"] - x["total"]) < 1e-9, True)
+check("not usable", abs(x["not_usable"] - (128 * 1024 - 102400) * 8 * 20 * 1e-5) < 1e-9, True)
+
+u = mp.sample_uniform(SH, 20000, 5)
+check("u only kernel with shm", {t["kernel"] for t in u}, {0})
+check("u words after the reserved bytes", all(1024 <= t["shm_offset"] < 1024 + 400 and t["shm_offset"] % 4 == 0 for t in u), True)
+check("u bits", all(0 <= t["bit"] < 32 for t in u), True)
+by_sm = collections.Counter(t["sm"] for t in u)
+check("u sm follows the residence", abs(by_sm[3] / len(u) - 1250 / 1750) < 0.02, True)
+check("u time inside a residence", all((t["sm"] == 7 and 50 <= t["inst"] < 100) or (t["sm"] == 3 and 0 <= t["inst"] < 100) for t in u), True)
+info = mp.target_to_info(u[0])
+check("u info has sm and offset", "sm %d\n" % u[0]["sm"] in info and "shm_offset %d\n" % u[0]["shm_offset"] in info, True)
+check("u same seed same targets", mp.sample_uniform(SH, 50, 9), mp.sample_uniform(SH, 50, 9))
+
+s_t = mp.sample_after_store(SH, 500, 5)
+check("s only kernel with stores", {t["kernel"] for t in s_t}, {0})
+check("s index", all(0 <= t["inst"] < 10 for t in s_t), True)
+for fn, name in ((mp.sample_uniform, "u"), (mp.sample_after_store, "s")):
+	try:
+		fn(SH[:1] + SH[2:], 1, 1)
+		check("no shared memory raises " + name, False, True)
+	except ValueError:
+		check("no shared memory raises " + name, True, True)
+
 print("%d passed, %d failed" % (passed, failed))
 sys.exit(1 if failed else 0)

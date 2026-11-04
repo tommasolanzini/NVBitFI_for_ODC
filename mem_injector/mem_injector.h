@@ -15,7 +15,9 @@ enum { MEM_NONE = 0, MEM_SELECTED = 1, MEM_INJECTED = 2 };
 enum { FLIP_NOT_YET = 0, FLIP_RUNNING = 1, FLIP_DONE = 2 };
 
 // First access to the flipped byte after the flip, stored in firstAccess
-enum { ACCESS_NONE = 0, ACCESS_READ = 1, ACCESS_WRITE = 2 };
+// ACCESS_AMBIGUOUS (shared memory): a store checked before the flip and finished
+// after it. It cannot be told whether the store came before or after the flip.
+enum { ACCESS_NONE = 0, ACCESS_READ = 1, ACCESS_WRITE = 2, ACCESS_AMBIGUOUS = 3 };
 
 // Flags of an instrumented memory instruction
 enum { MEM_FLAG_LOAD = 1, MEM_FLAG_STORE = 2 };
@@ -38,7 +40,27 @@ typedef struct {
 	unsigned long long instID;       // dynamic instruction that flips (timing mode b)
 	unsigned long long wordAddr;     // address of the 32-bit word
 	unsigned long long flipByteAddr; // address of the byte holding the flipped bit
+
+	// Shared memory (modes s and u). The offsets are relative to the shared
+	// window of a CTA. flipCta, flipByteAddr, wordAddr and mask are set by the
+	// flipping thread before FLIP_RUNNING and read with atomics, as fired.
+	int applyFlip;            // 0 with DUMMY=1
+	int targetSM;             // mode u: SM of the flip
+	int claimed;              // mode u: a thread took the flip
+	int flipCta;              // CTA of the flip: only its threads can see it
+	unsigned int bitSeed;     // mode s: picks the bit inside the stored bytes; mode u: bit of the word
+	unsigned long long flipOffsetTarget; // mode u: offset of the word in the window of the CTA
 } mem_info_t;
+
+// Residency of a CTA in the count phase, on the clock of the dynamic
+// instructions of the kernel. first and last are index + 1, 0 = never seen.
+#define MEM_MAX_CTAS 4096
+typedef struct {
+	unsigned long long first;
+	unsigned long long last;
+	int sm;
+	int pad;
+} mem_cta_t;
 
 // Injection record, in host-mapped pinned memory: the host can read it after a
 // kernel error or while a kernel hangs. The device updates the trace counters
@@ -66,6 +88,8 @@ typedef struct {
 	unsigned int hostReads;    // host copies that read the flipped byte
 	unsigned int hostWrites;   // host copies or memsets that wrote it
 	unsigned long long readKernels; // bit k: kernel k read the byte after the flip (bit 63: k >= 63)
+	unsigned int shmWordOffset; // shared memory: offset of the flipped word in the window of the CTA
+	unsigned int shmMask;       // shared memory: XOR mask chosen by the flipping thread
 } mem_shadow_t;
 
 #endif

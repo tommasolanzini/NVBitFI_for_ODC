@@ -1,7 +1,8 @@
 # Memory-data injector
 
 Corrupts one bit of data where it is stored, not the copy in one thread's
-register. Only global memory is implemented so far; shared memory is still to do.
+register. Global memory and shared memory are implemented; see "Shared memory" below
+for the second one.
 
 ## What it does
 
@@ -42,6 +43,67 @@ Hence the subclasses (`masked_subclass` in the JSONL):
 | `read_masked` | flipped bit read, output unchanged | yes |
 
 Mode a is the control: no stale copy can survive the kernel boundary.
+
+## Shared memory
+
+Shared memory is the working memory of a CTA, addressed as a window of that CTA and
+stored in the same RAM of the SM as L1 data. It exists only while the CTA is resident,
+so there is no mode between kernels and a flip cannot leave its CTA or kernel. It does
+not go through L1: no stale copies are expected, and the trace measures it. Measurements
+behind this section are in `tests/shm_probe/README.md`.
+
+| Mode | Flip | Use |
+|---|---|---|
+| `s` | Right after the N-th dynamic store to shared memory, one of the stored bits | Dataset for the network. It always hits live data, so it is not a model of upsets |
+| `u` | SM x offset x time: the first warp on the SM after the N-th dynamic instruction flips a word of its own CTA | The only one for AVF and coverage |
+
+Both flip with `atomicXor` (`ATOMS`), which is atomic against the other threads of the CTA.
+
+**Sampling of mode u.** An upset hits the RAM of an SM, not a CTA, so each resident bit
+at each time has the same weight. The count phase logs the SM, first and last instruction
+of each CTA (`ctas` in the kernel event). A target picks a CTA by bytes x residence, then a
+time inside the residence and a word of the window (`sample_uniform`). The CTA in the
+target is used only for this: a later run can schedule the CTAs differently, so the flip
+goes to whichever CTA is running on that SM at that time. If none is, the run is not
+injected (`injected: false`, outcome Uncategorized).
+
+**Bits not sampled** (`exposure-shared.json`, in bit-seconds over all SMs and the whole run):
+
+| Term | What | Treated as |
+|---|---|---|
+| `windows` | application part of the windows of resident CTAs | injected |
+| `reserved` | first 1024 bytes of each window, unknown content | not injected, counted apart |
+| `free` | usable by shared memory, no CTA there | Masked by definition |
+| `not_usable` | 128 KiB (specs) - 102400 bytes (`cudaDeviceProp`) | Masked by definition, see limits |
+
+**One more subclass:** `ambiguous` (`first_access` 3). A store was checked before the flip
+and finished after it, so it cannot be told which came first. Reads after a store to the
+byte are not counted in shared memory. This was added after one DUMMY=1 run of 25 showed 3
+new reads with no flip, on a word that was then written twice: the data of a store read
+back as the flipped bit is the likely cause, not a proven one. With the check, 0 of 200
+DUMMY=1 runs show new reads, but `ambiguous` itself has not occurred yet (0 of 400 runs), so
+that path is not exercised and the absence of false reads could also be chance.
+
+**Limits of shared memory:**
+
+- **Free and not usable bytes may not be masked.** That storage is shared with L1 data, and
+  how it is split at run time is not documented. If a part of it holds L1 lines, an upset
+  there can reach the application. So the two terms are kept apart and can be moved.
+- **The clock is the dynamic instruction count with the tool running.** Time inside a kernel
+  and residence are proportional to it, which is an approximation. The windows of a run
+  come from one timing run, as for global memory.
+- **Among the CTAs resident on an SM, the flip goes to the first warp that executes,** not to a
+  uniform choice. CTAs that execute more are slightly favoured.
+- **The trace can miss a load** that passes the check just before the flip. Pilot: 1 SDC of 40
+  in mode u with no new read and a store as first access. So a few `overwritten` runs could
+  really be `read_masked`.
+- **Not traced:** shared memory reached through a generic pointer, `GLOBAL_TO_SHARED` and
+  `DISTRIBUTED_SHARED`. The record counts them in `unseen_shared_instrs`: runs with a non-zero
+  value have an incomplete trace. shm_stencil has none.
+- **Not exercised:** dynamic shared memory (the window size is taken as static + dynamic from
+  `nvbit_get_func_config`, checked only with static), atomics of the application on shared
+  memory, a crash from a flip in shared memory, and a run not injected because the SM was idle
+  in a pilot (only in a hand-built flip).
 
 ## Conventions and traps
 
@@ -113,6 +175,29 @@ DUMMY=1, 25 per mode: all Masked, `old_word == new_word`. DUMMY=0, 100 per mode:
 Only 4 of 131 Masked runs show tolerance. Stale reads occurred in 1 run of mode b
 (4 old reads, 31 new, Masked). The sample is too small to compare the two modes.
 
+Pilot on shm_stencil, single bit (`logs/mem-pilot-2026-11-04-shm/`, not a final campaign).
+DUMMY=1, 100 per mode: all Masked, `old_word == new_word`, no new read. DUMMY=0, 100 per mode:
+
+| Mode | SDC | Crash | Masked | `no_read` | `overwritten` | `stale_only` | `read_masked` | `ambiguous` |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| s | 97 | 0 | 3 | 0 | 0 | 0 | 3 | 0 |
+| u | 40 | 0 | 60 | 8 | 52 | 0 | 0 | 0 |
+
+No read returned the old bit in the 200 runs. All 137 SDCs change only the row of the logged
+CTA, within 8 columns of the flipped word (8 stencil iterations).
+
+Hand-built flips on shm_stencil, as predicted except the last line:
+
+| Flip | Result |
+|---|---|
+| `coef[60]`, mid kernel | 5 new reads, row of the CTA wrong in columns 56-64 |
+| `coef` or `buf` word before the first store | `overwritten`, Masked |
+| `buf` word, mid kernel, in its dead half | `overwritten`, Masked |
+| last store of the run (mode s) | 1 new read, only the element of `tid` wrong |
+| first store of the run (mode s) | 3 new reads, row wrong in columns 0-8 |
+| store index beyond the last | not injected |
+| `coef[60]` at instruction 1933000 of SM 0 (predicted `no_read`) | not injected: SM 0 had no CTA left |
+
 ## Run
 
 ```bash
@@ -124,4 +209,5 @@ python3 run_mem_campaign.py profile gemm $D
 python3 run_mem_campaign.py list gemm $D --mode b -n 100 --seed 1
 python3 run_mem_campaign.py run gemm $D --mode b
 # results: $D/results-modeb.jsonl, per-run dirs in $D/runs-modeb/
+# shared memory: the same with shm_stencil and --mode s or --mode u
 ```
