@@ -13,9 +13,9 @@ MODE_UNIFORM = "u"     # shared memory: uniform over SM x offset x time
 
 # Shared memory of this GPU (coverage inputs go in one table later)
 NUM_SMS = 20
-SHM_PHYSICAL = 128 * 1024 # L1 + shared storage per SM, from the chip specs: software cannot measure it
+SHM_PHYSICAL = 128 * 1024 # SRAM per SM, L1 data + shared, from the chip specs: software cannot measure it
 SHM_USABLE = 102400       # cudaDeviceProp::sharedMemPerMultiprocessor, tests/shm_probe
-SHM_RESERVED = 1024       # first bytes of the window of every CTA, not used by applications (tests/shm_probe)
+SHM_RESERVED = 1024       # cudaDevAttrReservedSharedMemoryPerBlock: first bytes of the window of every CTA
 
 # First access after the flip, as in mem_injector/mem_injector.h
 ACCESS_READ = 1
@@ -157,11 +157,14 @@ def peak_ctas_per_sm(kernel):
 	return peak
 
 
-# bits x time of the shared memory of all the SMs, in bit-seconds. Only "windows"
-# is sampled by the injections. The other terms are not:
-#   reserved:   first bytes of each window, no application data
-#   free:       usable by shared memory, no CTA resident there
-#   not_usable: never available to shared memory on this GPU (maybe L1 data)
+# bits x time of the SRAM of all the SMs (one structure of SHM_PHYSICAL bytes per
+# SM), in bit-seconds:
+#   windows:  application part of the windows of resident CTAs, reachable and injected
+#   reserved: reserved part of those windows, kept apart
+#   l1_data:  all the rest, L1 data: not reachable by software, so it is neither
+#             injected nor Masked. Its AVF has to come from the beam. Its two parts
+#             are never_shared (never usable as shared memory) and free_shared
+#             (usable as shared memory, no CTA there).
 def shared_exposure(events):
 	t0 = min((e["t0"] for e in events), default=0)
 	t_end = max((e["t1"] for e in events), default=0)
@@ -177,15 +180,46 @@ def shared_exposure(events):
 		if p:
 			peak = max(peak, max(p.values()))
 	total = SHM_PHYSICAL * 8 * NUM_SMS * duration * 1e-9
-	not_usable = (SHM_PHYSICAL - SHM_USABLE) * 8 * NUM_SMS * duration * 1e-9
-	return {"total": total, "windows": windows, "reserved": reserved, "not_usable": not_usable,
-		"free": max(total - windows - reserved - not_usable, 0.0), "run_seconds": duration * 1e-9,
-		"peak_ctas_on_one_sm": peak, "windows_fraction": windows / total if total else 0.0}
+	never_shared = (SHM_PHYSICAL - SHM_USABLE) * 8 * NUM_SMS * duration * 1e-9
+	free_shared = max(total - windows - reserved - never_shared, 0.0)
+	return {"total": total, "windows": windows, "reserved": reserved, "l1_data": never_shared + free_shared,
+		"never_shared": never_shared, "free_shared": free_shared, "run_seconds": duration * 1e-9,
+		"peak_ctas_on_one_sm": peak}
+
+
+L1_NOT_REACHABLE = "not reachable, AVF to be estimated with the beam"
+OUTCOME_SDC = (16, 17, 18)
+OUTCOME_CRASH = 20
+
+
+# AVF of shared memory from the runs of mode u, in two versions: on the injected
+# part only, and on the whole SRAM of the SM. The second has no single number: it
+# is the known part plus the shares whose AVF is not measured here. Runs not
+# injected are left out and counted.
+def shared_avf(results, exposure):
+	runs = [r for r in results if r.get("injected")]
+	n = len(runs)
+	sdc = sum(r["outcome"] in OUTCOME_SDC for r in runs)
+	crash = sum(r["outcome"] == OUTCOME_CRASH for r in runs)
+	avf = (sdc + crash) / n if n else 0.0
+	total = exposure["total"]
+	return {"runs": n, "not_injected": len(results) - n, "sdc": sdc, "crash": crash,
+		"avf_injected_part": avf,
+		"whole_sram": {
+			"windows_share": exposure["windows"] / total,
+			"known_part": avf * exposure["windows"] / total,
+			"reserved_share": exposure["reserved"] / total,
+			"reserved_avf": "not measured, kept apart",
+			"l1_data_share": exposure["l1_data"] / total,
+			"l1_data_avf": L1_NOT_REACHABLE,
+		}}
 
 
 # Mode u: every bit of every resident window at every time has the same weight.
 # Sampling a CTA by bytes x residence, then a time inside its residence, is the
-# same as sampling SM x address x time restricted to the resident bytes.
+# same as sampling SM x address x time restricted to the resident bytes. Only the
+# SM and the time are kept: at run time the tool picks among the CTAs resident
+# then (pick), because scheduling can place them differently.
 def sample_uniform(events, n, seed):
 	rng = random.Random(seed)
 	pairs, weights = [], []
@@ -201,7 +235,8 @@ def sample_uniform(events, n, seed):
 	for k, (sm, first, last) in rng.choices(pairs, weights=weights, k=n):
 		targets.append({"mode": MODE_UNIFORM, "kernel": k["k"], "kernel_name": k["name"], "event": k["e"],
 			"inst": rng.randrange(first - 1, last - 1), "sm": sm,
-			"shm_offset": SHM_RESERVED + rng.randrange(k["shm"] // 4) * 4, "bit": rng.randrange(32)})
+			"shm_offset": SHM_RESERVED + rng.randrange(k["shm"] // 4) * 4, "bit": rng.randrange(32),
+			"pick": rng.randrange(1 << 16)})
 	return targets
 
 
@@ -222,7 +257,7 @@ def sample_after_store(events, n, seed):
 # Contents of nvbitfi-injection-info.txt
 def target_to_info(t):
 	return "".join("%s %s\n" % (k, t[k]) for k in
-		("mode", "buffer", "size", "offset", "bit", "event", "kernel", "kernel_name", "inst", "sm", "shm_offset") if k in t)
+		("mode", "buffer", "size", "offset", "bit", "event", "kernel", "kernel_name", "inst", "sm", "shm_offset", "pick") if k in t)
 
 
 # Why a Masked run was masked, from the trace in the injection record. Only

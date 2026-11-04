@@ -50,17 +50,35 @@ typedef struct {
 	int flipCta;              // CTA of the flip: only its threads can see it
 	unsigned int bitSeed;     // mode s: picks the bit inside the stored bytes; mode u: bit of the word
 	unsigned long long flipOffsetTarget; // mode u: offset of the word in the window of the CTA
+	unsigned int pickSeed;    // mode u: picks a CTA among the resident ones
+	int chooserClaim;         // mode u: a thread is choosing the CTA
+	int chosenCta;            // mode u: CTA of the flip, CTA_NOT_CHOSEN until chosen
+	unsigned long long chooserInstr; // mode u: instruction index when the CTA was chosen
 } mem_info_t;
 
-// Residency of a CTA in the count phase, on the clock of the dynamic
-// instructions of the kernel. first and last are index + 1, 0 = never seen.
+#define CTA_NOT_CHOSEN (-1)
+
+// Residency of a CTA. Count phase: first and last are index + 1 on the clock of
+// the dynamic instructions, 0 = never seen. Mode u: first != 0 once the CTA has
+// started, exits = threads that reached EXIT.
 #define MEM_MAX_CTAS 4096
 typedef struct {
 	unsigned long long first;
 	unsigned long long last;
 	int sm;
+	unsigned int exits;
+	int slot;
 	int pad;
 } mem_cta_t;
+
+// Mode u: the CTAs resident on an SM, updated when a CTA enters and leaves, so that
+// choosing one takes two atomic reads. A scan of a table per CTA delayed the flip by
+// up to 30% of the kernel. 32 slots: this GPU has at most 24 CTAs per SM (tests/shm_probe).
+#define MEM_MAX_SMS 64
+typedef struct {
+	unsigned int mask; // bit k: slot k is in use
+	int cta[32];
+} mem_sm_t;
 
 // Injection record, in host-mapped pinned memory: the host can read it after a
 // kernel error or while a kernel hangs. The device updates the trace counters
@@ -90,6 +108,9 @@ typedef struct {
 	unsigned long long readKernels; // bit k: kernel k read the byte after the flip (bit 63: k >= 63)
 	unsigned int shmWordOffset; // shared memory: offset of the flipped word in the window of the CTA
 	unsigned int shmMask;       // shared memory: XOR mask chosen by the flipping thread
+	int residents;              // mode u: CTAs resident on the SM when the CTA was chosen, -1 = not chosen
+	int chosenCta;              // mode u: CTA chosen among them
+	int chosenExits;            // mode u: threads of that CTA already gone at that moment
 } mem_shadow_t;
 
 #endif

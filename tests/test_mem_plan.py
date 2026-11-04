@@ -107,8 +107,18 @@ check("windows", abs(x["windows"] - 400 * 8 * resident_ns * 1e-9) < 1e-12, True)
 check("reserved", abs(x["reserved"] - 1024 * 8 * resident_ns * 1e-9) < 1e-12, True)
 check("peak", x["peak_ctas_on_one_sm"], 2)
 check("run", abs(x["run_seconds"] - 1e-5) < 1e-15, True)
-check("exposure adds up", abs(x["windows"] + x["reserved"] + x["free"] + x["not_usable"] - x["total"]) < 1e-9, True)
-check("not usable", abs(x["not_usable"] - (128 * 1024 - 102400) * 8 * 20 * 1e-5) < 1e-9, True)
+check("exposure adds up", abs(x["windows"] + x["reserved"] + x["l1_data"] - x["total"]) < 1e-9, True)
+check("l1 parts", abs(x["never_shared"] + x["free_shared"] - x["l1_data"]) < 1e-9, True)
+check("never shared", abs(x["never_shared"] - (128 * 1024 - 102400) * 8 * 20 * 1e-5) < 1e-9, True)
+
+RES = [{"injected": True, "outcome": 16}] * 3 + [{"injected": True, "outcome": 20}] + [{"injected": True, "outcome": 3}] * 4 + [{"injected": False, "outcome": 19}]
+EXP = {"total": 100.0, "windows": 10.0, "reserved": 5.0, "l1_data": 85.0}
+a = mp.shared_avf(RES, EXP)
+check("avf runs", (a["runs"], a["not_injected"], a["sdc"], a["crash"]), (8, 1, 3, 1))
+check("avf injected part", a["avf_injected_part"], 0.5)
+check("avf whole sram known part", a["whole_sram"]["known_part"], 0.05)
+check("avf shares", (a["whole_sram"]["windows_share"], a["whole_sram"]["reserved_share"], a["whole_sram"]["l1_data_share"]), (0.1, 0.05, 0.85))
+check("avf l1 marked", a["whole_sram"]["l1_data_avf"], mp.L1_NOT_REACHABLE)
 
 u = mp.sample_uniform(SH, 20000, 5)
 check("u only kernel with shm", {t["kernel"] for t in u}, {0})
@@ -119,6 +129,7 @@ check("u sm follows the residence", abs(by_sm[3] / len(u) - 1250 / 1750) < 0.02,
 check("u time inside a residence", all((t["sm"] == 7 and 50 <= t["inst"] < 100) or (t["sm"] == 3 and 0 <= t["inst"] < 100) for t in u), True)
 info = mp.target_to_info(u[0])
 check("u info has sm and offset", "sm %d\n" % u[0]["sm"] in info and "shm_offset %d\n" % u[0]["shm_offset"] in info, True)
+check("u info has pick", "pick %d\n" % u[0]["pick"] in info, True)
 check("u same seed same targets", mp.sample_uniform(SH, 50, 9), mp.sample_uniform(SH, 50, 9))
 
 s_t = mp.sample_after_store(SH, 500, 5)

@@ -113,8 +113,8 @@ static int run_occupancy()
 	sms = prop.multiProcessorCount;
 	perblock = (int)prop.sharedMemPerBlock;
 	optin = (int)prop.sharedMemPerBlockOptin;
-	printf("{\"test\": \"device\", \"sms\": %d, \"sharedMemPerBlock\": %d, \"sharedMemPerBlockOptin\": %d, \"sharedMemPerMultiprocessor\": %zu, \"maxBlocksPerMultiProcessor\": %d}\n",
-		sms, perblock, optin, prop.sharedMemPerMultiprocessor, prop.maxBlocksPerMultiProcessor);
+	printf("{\"test\": \"device\", \"sms\": %d, \"sharedMemPerBlock\": %d, \"sharedMemPerBlockOptin\": %d, \"sharedMemPerMultiprocessor\": %zu, \"maxBlocksPerMultiProcessor\": %d, \"reservedSharedMemPerBlock\": %zu}\n",
+		sms, perblock, optin, prop.sharedMemPerMultiprocessor, prop.maxBlocksPerMultiProcessor, prop.reservedSharedMemPerBlock);
 
 	unsigned *inflight, *peak, *total;
 	check(cudaMalloc(&inflight, NUM_SMS_MAX * 4), "malloc");

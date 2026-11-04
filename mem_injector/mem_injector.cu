@@ -51,6 +51,7 @@ static const char *event_names[] = {"none", "kernel", "alloc", "free", "h2d", "d
 
 __managed__ mem_info_t info;
 __managed__ mem_cta_t cta_table[MEM_MAX_CTAS];
+__managed__ mem_sm_t sm_table[MEM_MAX_SMS];
 
 static pthread_mutex_t mutex = PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP;
 static thread_local bool in_tool = false; // CUDA calls made by the tool itself are not events
@@ -74,6 +75,7 @@ static struct {
 	unsigned long long instID = 0; // mode s: index among the shared stores
 	int sm = -1;             // mode u
 	unsigned shmOffset = 0;  // mode u: word in the window of the CTA
+	unsigned pick = 0;       // mode u: picks a CTA among the resident ones
 } target;
 
 static bool is_shared_mode() { return target.mode == "s" || target.mode == "u"; }
@@ -111,6 +113,9 @@ static void init_shadow_fields(mem_shadow_t *s) {
 	s->smID = -1;
 	s->warpID = -1;
 	s->laneID = -1;
+	s->residents = -1;
+	s->chosenCta = -1;
+	s->chosenExits = -1;
 }
 
 static void ensure_shadow() {
@@ -140,6 +145,8 @@ static void write_record(const mem_shadow_t &r) {
 	if (is_shared_mode()) {
 		fout << "targetSM: " << target.sm << "\n";
 		fout << "unseenSharedInstrs: " << unseen_shared_instrs << "\n";
+		fout << "residents: " << r.residents << "\n";
+		fout << "chosenCta: " << r.chosenCta << "\n";
 		if (r.state >= MEM_SELECTED) {
 			fout << "shmWordOffset: " << r.shmWordOffset << "\n";
 			fout << "shmMask: 0x" << std::hex << r.shmMask << std::dec << "\n";
@@ -210,6 +217,7 @@ static void parse_target() {
 		else if (key == "inst") ifs >> target.instID;
 		else if (key == "sm") ifs >> target.sm;
 		else if (key == "shm_offset") ifs >> target.shmOffset;
+		else if (key == "pick") ifs >> target.pick;
 		else { printf("mem_injector: unknown key %s\n", key.c_str()); exit(1); }
 	}
 	assert(target.mode == "a" || target.mode == "b" || is_shared_mode());
@@ -319,7 +327,17 @@ static void add_flip_uniform(Instr *i) {
 	nvbit_add_call_arg_const_val64(i, (uint64_t)&info);
 	nvbit_add_call_arg_const_val64(i, (uint64_t)shadow_device_ptr);
 	nvbit_add_call_arg_const_val64(i, (uint64_t)&counters[0]);
+	nvbit_add_call_arg_const_val64(i, (uint64_t)&sm_table[0]);
+	nvbit_add_call_arg_const_val64(i, (uint64_t)&cta_table[0]);
 	nvbit_add_call_arg_const_val32(i, i->getOffset());
+	nvbit_add_call_arg_guard_pred_val(i);
+}
+
+static void add_cta_call(Instr *i, const char *fn) {
+	nvbit_insert_call(i, fn, IPOINT_BEFORE);
+	nvbit_add_call_arg_const_val64(i, (uint64_t)&info);
+	nvbit_add_call_arg_const_val64(i, (uint64_t)&cta_table[0]);
+	nvbit_add_call_arg_const_val64(i, (uint64_t)&sm_table[0]);
 	nvbit_add_call_arg_guard_pred_val(i);
 }
 
@@ -374,7 +392,11 @@ static void instrument(CUcontext ctx, CUfunction func) {
 				add_count_call(i);
 				add_profile_calls(i);
 			} else if (target.mode == "u") {
+				// this order: a CTA is registered before its first flip call, and
+				// a thread is counted as gone only after its last one
+				if (f == func && i->getOffset() == 0) add_cta_call(i, "shm_cta_enter");
 				add_flip_uniform(i);
+				if (!strncmp(i->getOpcode(), "EXIT", 4)) add_cta_call(i, "shm_cta_exit");
 				add_shared_trace_call(i);
 			} else if (target.mode == "s") {
 				// this order: the store that triggers the flip must not look ambiguous
@@ -402,6 +424,8 @@ static void sync_info(bool arm) {
 			info.bitSeed = target.bit;
 			info.flipOffsetTarget = target.shmOffset;
 			info.applyFlip = DUMMY ? 0 : 1;
+			info.pickSeed = target.pick;
+			info.chosenCta = CTA_NOT_CHOSEN;
 		}
 		cudaDeviceSynchronize();
 		return;
@@ -433,7 +457,10 @@ static void on_kernel_entry(CUcontext ctx, nvbit_api_cuda_t cbid, void *params) 
 	instrument(ctx, func);
 	cudaDeviceSynchronize();
 	init_counters();
-	if (phase == PHASE_COUNT) memset((void *)cta_table, 0, sizeof(cta_table));
+	if (phase == PHASE_COUNT || target.mode == "u") {
+		memset((void *)cta_table, 0, sizeof(cta_table));
+		memset((void *)sm_table, 0, sizeof(sm_table));
+	}
 
 	bool arm = false;
 	if (phase == PHASE_COUNT) {
@@ -473,6 +500,20 @@ static void on_kernel_exit(CUcontext ctx, nvbit_api_cuda_t cbid, void *params) {
 		exit(1);
 	}
 
+	if (phase == PHASE_INJECT && target.mode == "u" && kernel_id == target.kernel) {
+		// Check of the residency: at the end of a kernel every CTA has left its SM
+		int entered = 0, slots_in_use = 0;
+		unsigned exits_min = ~0u, exits_max = 0;
+		for (int c = 0; c < MEM_MAX_CTAS; c++) {
+			if (!cta_table[c].first) continue;
+			entered++;
+			exits_min = std::min(exits_min, cta_table[c].exits);
+			exits_max = std::max(exits_max, cta_table[c].exits);
+		}
+		for (int s = 0; s < MEM_MAX_SMS; s++) slots_in_use += __builtin_popcount(sm_table[s].mask);
+		fout << "ctasEntered: " << entered << "\nctaExitsMin: " << exits_min << "\nctaExitsMax: " << exits_max << "\nslotsInUse: " << slots_in_use << "\n";
+		fout << "chosenAt: " << info.chooserInstr << "\nchosenExitsAtChoice: " << shadow->chosenExits << "\n";
+	}
 	if (phase == PHASE_INJECT) {
 		loads_seen = info.loads;
 		sm_loads_seen = info.smLoads;

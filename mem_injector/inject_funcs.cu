@@ -196,10 +196,71 @@ extern "C" __device__ __noinline__ void shm_flip_after_store(uint64_t pinfo, uin
 	shm_do_flip(info, (mem_shadow_t *)pshadow, byte_off & ~3u, byte_off, 1u << ((byte_off & 3) * 8 + bit % 8), myIdx, offset, lane);
 }
 
+// Mode u: registers a CTA at the first instruction of the kernel, and counts the
+// threads that leave it. Between the two the CTA is resident on its SM.
+extern "C" __device__ __noinline__ void shm_cta_enter(uint64_t pinfo, uint64_t ptable, uint64_t psms, int predicate) {
+	if (!((mem_info_t *)pinfo)->armed) return;
+	const unsigned pred_mask = __ballot_sync(__activemask(), predicate);
+	if (!predicate || get_laneid() != __ffs(pred_mask) - 1) return;
+	const int cta = flat_cta();
+	const int sm = get_smid();
+	if (cta >= MEM_MAX_CTAS || sm >= MEM_MAX_SMS) return;
+	mem_cta_t *e = (mem_cta_t *)ptable + cta;
+	if (atomicCAS(&e->first, 0ull, 1ull) != 0ull) return; // only the first warp of the CTA
+	mem_sm_t *s = (mem_sm_t *)psms + sm;
+	for (int tries = 0; tries < 64; tries++) {
+		const int free_bit = __ffs(~atomicAdd(&s->mask, 0u)) - 1;
+		if (free_bit < 0) return; // no slot: the CTA cannot be chosen
+		if (!(atomicOr(&s->mask, 1u << free_bit) & (1u << free_bit))) {
+			atomicExch(&s->cta[free_bit], cta);
+			atomicExch(&e->slot, free_bit);
+			atomicExch(&e->sm, sm);
+			return;
+		}
+	}
+}
+
+extern "C" __device__ __noinline__ void shm_cta_exit(uint64_t pinfo, uint64_t ptable, uint64_t psms, int predicate) {
+	if (!((mem_info_t *)pinfo)->armed) return;
+	const unsigned pred_mask = __ballot_sync(__activemask(), predicate);
+	if (!predicate || get_laneid() != __ffs(pred_mask) - 1) return;
+	const int cta = flat_cta();
+	const int sm = get_smid();
+	if (cta >= MEM_MAX_CTAS || sm >= MEM_MAX_SMS) return;
+	mem_cta_t *e = (mem_cta_t *)ptable + cta;
+	const unsigned leaving = __popc(pred_mask);
+	if (atomicAdd(&e->exits, leaving) + leaving < blockDim.x * blockDim.y * blockDim.z) return;
+	atomicAnd(&((mem_sm_t *)psms)[sm].mask, ~(1u << atomicAdd(&e->slot, 0)));
+}
+
+// One thread, once: picks a CTA among those resident on its SM. Atomic reads,
+// because a plain load can return a stale L1 copy (tests/l1_probe). The choice is
+// published here, before the slow writes to host memory: with the writes first,
+// the chosen CTA often finished before it could see the choice.
+__inline__ __device__ int shm_choose_cta(mem_info_t *info, mem_shadow_t *r, mem_sm_t *sms, mem_cta_t *table) {
+	mem_sm_t *s = sms + get_smid();
+	unsigned mask = atomicAdd(&s->mask, 0u);
+	const int residents = __popc(mask);
+	int chosen = flat_cta(); // no slot seen: this thread's CTA is resident anyway
+	if (residents > 0) {
+		for (int left = (int)(info->pickSeed % (unsigned)residents); left > 0; left--) mask &= mask - 1;
+		chosen = atomicAdd(&s->cta[__ffs(mask) - 1], 0);
+	}
+	const int exits = (int)atomicAdd(&table[chosen].exits, 0u);
+	atomicExch(&info->chosenCta, chosen);
+	volatile mem_shadow_t *rec = (volatile mem_shadow_t *)r;
+	rec->residents = residents;
+	rec->chosenCta = chosen;
+	rec->chosenExits = exits;
+	__threadfence_system();
+	return chosen;
+}
+
 // Mode u: time = N-th dynamic instruction of the kernel. The first warp on the
-// target SM that executes an instruction after it flips a word of its own CTA.
+// target SM after it picks a CTA at random among the residents of the SM. A thread
+// can only reach the window of its own CTA, so the next warp of that CTA flips.
 extern "C" __device__ __noinline__ void shm_flip_uniform(uint64_t pinfo, uint64_t pshadow, uint64_t pcounter,
-		int offset, int predicate) {
+		uint64_t psms, uint64_t ptable, int offset, int predicate) {
 	mem_info_t *info = (mem_info_t *)pinfo;
 	if (!info->armed) return;
 	const unsigned pred_mask = __ballot_sync(__activemask(), predicate);
@@ -208,6 +269,13 @@ extern "C" __device__ __noinline__ void shm_flip_uniform(uint64_t pinfo, uint64_
 	if (lane != __ffs(pred_mask) - 1) return;
 	const unsigned long long base = atomicAdd((unsigned long long *)pcounter, (unsigned long long)__popc(pred_mask));
 	if (base < info->instID || (int)get_smid() != info->targetSM) return;
+	int chosen = atomicAdd(&info->chosenCta, 0);
+	if (chosen == CTA_NOT_CHOSEN) {
+		if (atomicCAS(&info->chooserClaim, 0, 1) != 0) return; // another warp is choosing
+		atomicExch(&info->chooserInstr, base);
+		chosen = shm_choose_cta(info, (mem_shadow_t *)pshadow, (mem_sm_t *)psms, (mem_cta_t *)ptable);
+	}
+	if (chosen != flat_cta()) return;
 	if (atomicCAS(&info->claimed, 0, 1) != 0) return;
 	const unsigned word_off = (unsigned)info->flipOffsetTarget;
 	shm_do_flip(info, (mem_shadow_t *)pshadow, word_off, word_off + info->bitSeed / 8, 1u << info->bitSeed, base, offset, lane);

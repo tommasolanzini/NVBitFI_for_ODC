@@ -55,45 +55,58 @@ behind this section are in `tests/shm_probe/README.md`.
 | Mode | Flip | Use |
 |---|---|---|
 | `s` | Right after the N-th dynamic store to shared memory, one of the stored bits | Dataset for the network. It always hits live data, so it is not a model of upsets |
-| `u` | SM x offset x time: the first warp on the SM after the N-th dynamic instruction flips a word of its own CTA | The only one for AVF and coverage |
+| `u` | SM x offset x time, with the CTA picked at random among those resident on the SM | The only one for AVF and coverage |
 
 Both flip with `atomicXor` (`ATOMS`), which is atomic against the other threads of the CTA.
 
-**Sampling of mode u.** An upset hits the RAM of an SM, not a CTA, so each resident bit
-at each time has the same weight. The count phase logs the SM, first and last instruction
-of each CTA (`ctas` in the kernel event). A target picks a CTA by bytes x residence, then a
-time inside the residence and a word of the window (`sample_uniform`). The CTA in the
-target is used only for this: a later run can schedule the CTAs differently, so the flip
-goes to whichever CTA is running on that SM at that time. If none is, the run is not
-injected (`injected: false`, outcome Uncategorized).
+**Sampling of mode u.** An upset hits the SRAM of an SM, not a CTA, so each resident bit at
+each time has the same weight. The count phase logs the SM, first and last instruction of each
+CTA (`ctas` in the kernel event). A target keeps an SM, a time and a word of the window
+(`sample_uniform`). At run time the first warp on that SM after that time picks a CTA at random
+among those resident there, because a thread can only reach the window of its own CTA, and the
+next warp of that CTA flips. Scheduling can place the CTAs differently from the profile, so
+the choice cannot be made in advance.
 
-**Bits not sampled** (`exposure-shared.json`, in bit-seconds over all SMs and the whole run):
+The residents are kept in a mask per SM, updated when a CTA enters (first instruction of the
+kernel) and leaves (all its threads at EXIT). So the choice takes 2 atomic reads. Two earlier
+versions showed why this matters, both on the same pilot:
+
+| Version | Median delay of the flip | Largest | Not injected |
+|---|---:|---:|---:|
+| Scan of a table with one entry per CTA | 154108 instructions | 582518 | 10 of 100 |
+| Mask, choice published after the writes to host memory | 19130 | 345956 | 5 of 100 |
+| Mask, choice published first (current) | 6471 (0.33% of the kernel) | 23268 (1.2%) | 0 of 100 |
+
+**The SRAM as one structure** (`exposure-shared.json`, bit-seconds over all SMs and the whole run):
 
 | Term | What | Treated as |
-|---|---|---|
-| `windows` | application part of the windows of resident CTAs | injected |
-| `reserved` | first 1024 bytes of each window, unknown content | not injected, counted apart |
-| `free` | usable by shared memory, no CTA there | Masked by definition |
-| `not_usable` | 128 KiB (specs) - 102400 bytes (`cudaDeviceProp`) | Masked by definition, see limits |
+|---|---|---:|
+| `windows` | application part of the windows of resident CTAs | reachable, injected |
+| `reserved` | `cudaDevAttrReservedSharedMemoryPerBlock` (1024 bytes) per resident CTA | kept apart, not injected |
+| `l1_data` | all the rest: `never_shared` (128 KiB - 102400 bytes) + `free_shared` | L1 data: not reachable, not Masked |
+
+**AVF in two versions** (`run_mem_campaign.py avf`, from mode u only): on the injected part only,
+and on the whole SRAM. The second is not one number: it is a known part (AVF x share of the windows)
+plus the share of `reserved` and the share of `l1_data`, marked "not reachable, AVF to be estimated
+with the beam".
 
 **One more subclass:** `ambiguous` (`first_access` 3). A store was checked before the flip
 and finished after it, so it cannot be told which came first. Reads after a store to the
 byte are not counted in shared memory. This was added after one DUMMY=1 run of 25 showed 3
 new reads with no flip, on a word that was then written twice: the data of a store read
 back as the flipped bit is the likely cause, not a proven one. With the check, 0 of 200
-DUMMY=1 runs show new reads, but `ambiguous` itself has not occurred yet (0 of 400 runs), so
-that path is not exercised and the absence of false reads could also be chance.
+DUMMY=1 runs show new reads. `ambiguous` occurs in about 1-2 runs of 100 in mode u.
 
 **Limits of shared memory:**
 
-- **Free and not usable bytes may not be masked.** That storage is shared with L1 data, and
-  how it is split at run time is not documented. If a part of it holds L1 lines, an upset
-  there can reach the application. So the two terms are kept apart and can be moved.
+- **The split of `l1_data` assumes** that the 28 KiB and the free shared space hold L1 data. How the
+  driver splits the SRAM at run time is not documented, and 128 KiB comes from the chip specs.
 - **The clock is the dynamic instruction count with the tool running.** Time inside a kernel
   and residence are proportional to it, which is an approximation. The windows of a run
   come from one timing run, as for global memory.
-- **Among the CTAs resident on an SM, the flip goes to the first warp that executes,** not to a
-  uniform choice. CTAs that execute more are slightly favoured.
+- **The flip comes slightly after the sampled time:** the next warp of the chosen CTA has to run.
+  A CTA can only read its window through its own threads, so little can happen in between, except
+  in its other warps.
 - **The trace can miss a load** that passes the check just before the flip. Pilot: 1 SDC of 40
   in mode u with no new read and a store as first access. So a few `overwritten` runs could
   really be `read_masked`.
@@ -102,8 +115,9 @@ that path is not exercised and the absence of false reads could also be chance.
   value have an incomplete trace. shm_stencil has none.
 - **Not exercised:** dynamic shared memory (the window size is taken as static + dynamic from
   `nvbit_get_func_config`, checked only with static), atomics of the application on shared
-  memory, a crash from a flip in shared memory, and a run not injected because the SM was idle
-  in a pilot (only in a hand-built flip).
+  memory, a crash from a flip in shared memory, a run not injected because the SM was idle in
+  a pilot (only in a hand-built flip), and a CTA leaving before the choice: in this workload
+  all CTAs start together, so every choice saw 6 or 7 residents with no thread gone.
 
 ## Conventions and traps
 
@@ -175,16 +189,23 @@ DUMMY=1, 25 per mode: all Masked, `old_word == new_word`. DUMMY=0, 100 per mode:
 Only 4 of 131 Masked runs show tolerance. Stale reads occurred in 1 run of mode b
 (4 old reads, 31 new, Masked). The sample is too small to compare the two modes.
 
-Pilot on shm_stencil, single bit (`logs/mem-pilot-2026-11-04-shm/`, not a final campaign).
-DUMMY=1, 100 per mode: all Masked, `old_word == new_word`, no new read. DUMMY=0, 100 per mode:
+Pilot on shm_stencil, single bit (not a final campaign). Mode s in `logs/mem-pilot-2026-11-04-shm/`,
+mode u in `logs/mem-pilot-2026-11-04-shm-v2/`. DUMMY=1, 100 per mode: all Masked, `old_word == new_word`,
+no new read. DUMMY=0, 100 per mode:
 
 | Mode | SDC | Crash | Masked | `no_read` | `overwritten` | `stale_only` | `read_masked` | `ambiguous` |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
 | s | 97 | 0 | 3 | 0 | 0 | 0 | 3 | 0 |
-| u | 40 | 0 | 60 | 8 | 52 | 0 | 0 | 0 |
+| u | 41 | 0 | 59 | 5 | 49 | 0 | 3 | 2 |
 
-No read returned the old bit in the 200 runs. All 137 SDCs change only the row of the logged
-CTA, within 8 columns of the flipped word (8 stencil iterations).
+No read returned the old bit in the 200 runs. All 138 SDCs change only the row of the logged
+CTA, within 8 columns of the flipped word (8 stencil iterations). In mode u, the flipped CTA is
+the chosen one and the SM is the target in 100 of 100 runs, and at the end of the kernel all CTAs
+have left and no slot is in use.
+
+AVF of shared memory in shm_stencil, from mode u: 41% on the injected part (Wilson 95%: 31.9-50.8).
+On the whole SRAM: known part 2.5%, from windows 6.1% of bits x time; reserved 4.1%, not measured;
+L1 data 89.9%, not reachable, AVF to be estimated with the beam. This weight comes from one timing run.
 
 Hand-built flips on shm_stencil, as predicted except the last line:
 

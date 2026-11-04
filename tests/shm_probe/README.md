@@ -46,7 +46,8 @@ program. That is the race the trace reports as `ambiguous` (see `mem_injector/RE
 ## Capacity of one SM
 
 `cudaDeviceProp`: `sharedMemPerBlock` 49152, `sharedMemPerBlockOptin` 101376,
-`sharedMemPerMultiprocessor` 102400, `maxBlocksPerMultiProcessor` 24. So 102400 bytes
+`sharedMemPerMultiprocessor` 102400, `maxBlocksPerMultiProcessor` 24,
+`reservedSharedMemPerBlock` 1024 (also `cudaDevAttrReservedSharedMemoryPerBlock`). So 102400 bytes
 (100 KiB) are available to shared memory, not the 128 KiB of L1 and shared storage in
 the chip specs. The specs value is not measured by this probe.
 
@@ -56,13 +57,13 @@ Peak CTAs on one SM (the same on all 20 SMs), 3000 CTAs of 32 threads:
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
 | Peak | 24 | 20 | 11 | 5 | 3 | 2 | 1 | 1 |
 
-`min(24, floor(102400 / (S + 1024)))` gives every value of the table. Together with
-data starting at 1024 and `sharedMemPerBlockOptin = 102400 - 1024`, this says that
-each CTA takes 1 KiB more than it declares. That is inferred: no document says it.
+`min(24, floor(102400 / (S + 1024)))` gives every value of the table. So each CTA takes
+the 1024 bytes that the driver reserves per block on top of what it declares. They are the
+first bytes of the window: `sharedMemPerBlockOptin = 102400 - 1024`, and data start at 1024.
 
 ## The first KiB of the window
 
-What it holds is unknown. Flips of bit 5 in all 256 words of `[0, 1024)`, in `k_known`,
+It is reserved by the driver; what it holds is not documented. Flips of bit 5 in all 256 words of `[0, 1024)`, in `k_known`,
 after its stores: all 256 runs exit 0 with a correct output, and every word read 0
 before the flip. This is one bit, one kernel and one time, so it does not prove the
 area is unused in general. It is counted apart from free memory and not injected.

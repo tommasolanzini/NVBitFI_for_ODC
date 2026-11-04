@@ -6,6 +6,7 @@
 #   run_mem_campaign.py list <app> <dir> --mode a|b|s|u -n N --seed S
 #   run_mem_campaign.py run <app> <dir> --mode a|b|s|u
 #   run_mem_campaign.py one <app> <dir> <file with one target as JSON>
+#   run_mem_campaign.py avf <app> <dir>    AVF of shared memory, from mode u
 #
 # Reuses the classification of run_one_injection.py, so that the outcomes mean
 # the same as in the register campaigns. Build first:
@@ -108,7 +109,8 @@ def record_from_log(log):
 		mask = to_int(log.get("shmMask"), 0)
 		r.update({"target_sm": to_int(log.get("targetSM")), "offset": to_int(log.get("shmWordOffset")),
 			"bit": mask.bit_length() - 1 if mask else -1, "buffer": -1, "buffer_size": -1,
-			"unseen_shared_instrs": to_int(log.get("unseenSharedInstrs"), 0)})
+			"unseen_shared_instrs": to_int(log.get("unseenSharedInstrs"), 0),
+			"residents": to_int(log.get("residents")), "chosen_cta": to_int(log.get("chosenCta"))})
 	return r
 
 
@@ -168,9 +170,17 @@ def cmd_one(a, base):
 	run_target(a, base, json.load(open(a.target)), "results-manual.jsonl")
 
 
+def cmd_avf(a, base):
+	results = [json.loads(line) for line in open(base + "/results-mode" + mp.MODE_UNIFORM + ".jsonl")]
+	exposure = json.load(open(base + "/exposure-shared.json"))
+	x = mp.shared_avf(results, exposure)
+	json.dump(x, open(base + "/avf-shared.json", "w"), indent=1)
+	print(json.dumps(x, indent=1))
+
+
 def main():
 	ap = argparse.ArgumentParser()
-	ap.add_argument("command", choices=["profile", "list", "run", "one"])
+	ap.add_argument("command", choices=["profile", "list", "run", "one", "avf"])
 	ap.add_argument("app")
 	ap.add_argument("dir")
 	ap.add_argument("target", nargs="?")
@@ -180,7 +190,7 @@ def main():
 	a = ap.parse_args()
 	base = os.path.abspath(a.dir)
 	os.makedirs(base, exist_ok=True)
-	{"profile": cmd_profile, "list": cmd_list, "run": cmd_run, "one": cmd_one}[a.command](a, base)
+	{"profile": cmd_profile, "list": cmd_list, "run": cmd_run, "one": cmd_one, "avf": cmd_avf}[a.command](a, base)
 
 
 if __name__ == "__main__":
