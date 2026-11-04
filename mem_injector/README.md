@@ -156,10 +156,23 @@ DUMMY=1 runs show new reads. `ambiguous` occurs in about 1-2 runs of 100 in mode
 - Times come from a single timing run. Total run time varied between 2.2 and 6.3 ms in
   the pilot, so the weights between kernels and between modes are noisy.
 
+## The first launch of a kernel
+
+The first launch of a kernel takes far longer than the kernel, and this inflates every time weight
+that uses the duration of a kernel. In a run with the tool in its timing phase, the first kernel of
+ptr_chase took 1879 us for 57344 instructions and the second 51 us for 1658880. Without the tool,
+shm_stencil launched 5 times took 64-73 us the first time and 7-9 us after that. In the timing phase
+its only kernel took about 1650 us. The cause is presumably the loading of the module, not checked
+further. The instruction clock inside a kernel is not affected.
+
+So in mode b the first kernel of a run gets too many flips, and the windows of shared memory get too
+much weight. To fix before a final campaign.
+
 ## Not exercised yet
 
-The crash path (gemm buffers hold no pointers, so no flip crashed), the timeout path,
-and frees of the target buffer (gemm never frees).
+The SIGKILL fallback of the timeout (the SIGINT handler has always been enough), and whether a
+reused address is really left alone after a free: the trace stops at the free, but ptr_chase does not
+check that `out` gets the address of `scale`.
 
 ## Validation
 
@@ -204,8 +217,41 @@ the chosen one and the SM is the target in 100 of 100 runs, and at the end of th
 have left and no slot is in use.
 
 AVF of shared memory in shm_stencil, from mode u: 41% on the injected part (Wilson 95%: 31.9-50.8).
-On the whole SRAM: known part 2.5%, from windows 6.1% of bits x time; reserved 4.1%, not measured;
-L1 data 89.9%, not reachable, AVF to be estimated with the beam. This weight comes from one timing run.
+On the whole SRAM, as computed: known part 2.5%, from windows 6.1% of bits x time; reserved 4.1%, not
+measured; L1 data 89.9%, not reachable, AVF to be estimated with the beam. **These shares are too high
+for the windows:** see "The first launch of a kernel" below. With the kernel at its real length they
+would be about 0.1% and 0.05% (an estimate). The 41% does not depend on it.
+
+Pilot on ptr_chase, global memory, single bit (`logs/mem-pilot-2026-11-04-ptr/`, not a final campaign).
+DUMMY=1, 100 per mode: all Masked, `old_word == new_word`. DUMMY=0, 100 per mode:
+
+| Mode | SDC | Crash | Timeout | Masked | `no_read` | `overwritten` | `stale_only` | `read_masked` |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| a | 20 | 8 | 1 | 71 | 4 | 64 | 0 | 3 |
+| b | 52 | 31 | 2 | 15 | 3 | 0 | 0 | 12 |
+
+- All 72 SDCs change only the element of the list or index hit. All 39 crashes have the full record.
+- Mode a: 63 runs flip `nodes` before its first copy, so the copy overwrites them.
+- Mode b: 96 runs flip during `k_prepare`, which does not read `nodes`, and only 4 during `k_walk`, a
+  result of the first launch below. So this pilot says little about stale L1 copies of pointers.
+- High word of `next` in mode b: 22 crashes of 22. Bits 4-9: 3 SDC, 2 timeouts.
+- All 15 `read_masked` flip bits 0-3 of a `value` or `weight`.
+- After a timeout the next run takes the usual 1.04 s.
+
+Hand-built flips on ptr_chase, as predicted except that bit 3 of `next` gave `illegal memory access`
+(Xid 13 and 43), not `misaligned address`:
+
+| Flip | Result |
+|---|---|
+| `value` of a node | 1 new read, only that list wrong |
+| `next` high word; null `next` bit 4; `heads` high word | crash, Xid 31, full record |
+| `next` bits 4-9 to an earlier node, mode a or b | timeout at 10 s, exit 255 from the SIGINT handler, full record (over 400000 new reads) |
+| `next` bits 4-9 to a later node | nodes skipped, only that list wrong |
+| `next` high word during `k_prepare` (mode b) | crash in the next kernel, record shows both |
+| `scale` before `k_prepare` | only that element wrong |
+| `scale` after `k_prepare`, on entry of its free | `no_read`, Masked |
+| `scale` after its free | not injected |
+| `out` before `k_walk`; `adj` on entry of its free | `overwritten`; `no_read` |
 
 Hand-built flips on shm_stencil, as predicted except the last line:
 

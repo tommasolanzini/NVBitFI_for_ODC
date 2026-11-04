@@ -250,6 +250,13 @@ apps = {
 			1, # expected runtime
 			"" # additional parameters to the run.sh
 		],
+	'ptr_chase': [
+			NVBITFI_HOME + '/test-apps/ptr_chase', # workload directory
+			'ptr_chase', # binary name
+			NVBITFI_HOME + '/test-apps/ptr_chase/', # path to the binary file
+			1, # expected runtime
+			"" # additional parameters to the run.sh
+		],
 }
 
 # Groups to inject per app (default: every group in inst_value_igid_bfm_map)
@@ -257,6 +264,7 @@ app_igids = {
 	'gemm': [G_GP, G_PR, G_TC, G_UNIFORM, G_FP32, G_LD], # no SFU instructions
 	'sfu_math': [G_SFU], # the other groups are covered by gemm
 	'shm_stencil': [], # only for the memory-data injector (mem_injector/)
+	'ptr_chase': [], # only for the memory-data injector (mem_injector/)
 }
 
 def igids_for_app(app):

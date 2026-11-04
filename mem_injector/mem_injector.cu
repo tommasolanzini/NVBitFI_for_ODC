@@ -494,6 +494,7 @@ static void on_kernel_exit(CUcontext ctx, nvbit_api_cuda_t cbid, void *params) {
 	if (le != cudaSuccess) {
 		std::cout << "ERROR FAIL in kernel execution (" << cudaGetErrorString(le) << "); ";
 		if (phase == PHASE_INJECT) {
+			loads_known = false; // the value in hand is from an earlier kernel
 			fout << "ERROR FAIL in kernel execution (" << cudaGetErrorString(le) << ")" << std::endl;
 			write_record_from_shadow(); // the context is dead: host memory only
 		}
