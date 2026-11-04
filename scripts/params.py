@@ -250,6 +250,13 @@ apps = {
 			1, # expected runtime
 			"" # additional parameters to the run.sh
 		],
+	'cnn': [
+			NVBITFI_HOME + '/test-apps/cnn', # workload directory
+			'cnn', # binary name
+			NVBITFI_HOME + '/test-apps/cnn/', # path to the binary file
+			1, # expected runtime
+			"" # additional parameters to the run.sh
+		],
 	'ptr_chase': [
 			NVBITFI_HOME + '/test-apps/ptr_chase', # workload directory
 			'ptr_chase', # binary name
@@ -263,6 +270,7 @@ apps = {
 app_igids = {
 	'gemm': [G_GP, G_PR, G_TC, G_UNIFORM, G_FP32, G_LD], # no SFU instructions
 	'sfu_math': [G_SFU], # the other groups are covered by gemm
+	'cnn': [G_GP, G_UNIFORM, G_FP32, G_LD], # no SFU or Tensor Core instructions; loop control is uniform (UISETP), so no predicate writers
 	'shm_stencil': [], # only for the memory-data injector (mem_injector/)
 	'ptr_chase': [], # only for the memory-data injector (mem_injector/)
 }
