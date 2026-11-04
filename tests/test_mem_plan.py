@@ -79,6 +79,30 @@ try:
 except ValueError:
 	check("different events are rejected", True, True)
 
+# Corrected kernel durations
+kt = mp.kernel_timing(["LAUNCH k0 0 900.0\nLAUNCH k0 1 50.0\nLAUNCH k0 2 4.0\nnoise\nLAUNCH k1 0 70.0", "LAUNCH k0 2 6.0\nLAUNCH k1 3 2.0"])
+check("only the later launches count", (kt["k0"]["launches"], kt["k0"]["mean_us"], kt["k1"]["mean_us"]), (2, 5.0, 2.0))
+check("short name of a kernel", mp.kernel_short_name("k_walk(Node* const*, float*)"), "k_walk")
+fast = {"k0": {"mean_us": 0.005}, "k1": {"mean_us": 0.003}}
+fixed = mp.apply_kernel_timing(EV, fast)
+fs, ftail = mp.slots_of(fixed)
+check("kernel slots use the corrected duration", [x["duration"] for x in fs if x["mode"] == "b"], [5, 3])
+check("gaps do not change", [x["duration"] for x in fs if x["mode"] == "a"], [x["duration"] for x in s if x["mode"] == "a"])
+check("events are not modified", "duration" in EV[3], False)
+try:
+	mp.apply_kernel_timing(EV, {"k0": {"mean_us": 1.0}})
+	check("a kernel without a duration is rejected", False, True)
+except ValueError:
+	check("a kernel without a duration is rejected", True, True)
+check("weights follow the corrected duration", {t["kernel"] for t in mp.sample_targets(mp.apply_kernel_timing(EV, {"k0": {"mean_us": 1e-9}, "k1": {"mean_us": 1.0}}), "b", 50, 1)}, {EV[5]["k"]})
+check("floor is subtracted, not below zero", mp.subtract_floor({"a": {"mean_us": 5.0, "launches": 2}, "b": {"mean_us": 1.0}}, 2.0), {"a": {"mean_us": 3.0, "launches": 2}, "b": {"mean_us": 0.0}})
+check("mode b shares follow bits x duration", mp.mode_b_shares(EV), {"k0": 8000 / 17000, "k1": 9000 / 17000})
+shm_ev = [{"e": 0, "kind": "kernel", "k": 0, "name": "k0", "t0": 0, "t1": 1000, "instrs": 100, "shm": 1024, "ctas": [[0, 1, 101]]},
+	{"e": 1, "kind": "free", "t0": 1100, "t1": 1100}]
+shm_fixed = mp.apply_kernel_timing(shm_ev, {"k0": {"mean_us": 0.1}})
+check("run time of the SRAM uses the corrected duration", round(mp.shared_exposure(shm_fixed)["run_seconds"] * 1e9), 200)
+check("residence of a CTA uses the corrected duration", mp.cta_seconds_ns(shm_fixed[0], [0, 1, 51]), 50.0)
+
 R = lambda **k: dict({"reads_new": 0, "reads_old": 0, "host_reads": 0, "first_access": 0}, **k)
 check("no access", mp.masked_subclass(R()), "no_read")
 check("written first", mp.masked_subclass(R(first_access=2)), "overwritten")

@@ -1,0 +1,6 @@
+repeat_ptr_chase
+repeat_shm_stencil
+repeat_gemm
+*.gen.cu
+*.bin
+empty_kernel

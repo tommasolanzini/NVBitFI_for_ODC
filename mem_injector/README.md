@@ -44,6 +44,13 @@ Hence the subclasses (`masked_subclass` in the JSONL):
 
 Mode a is the control: no stale copy can survive the kernel boundary.
 
+**Reading `stale_only` with care.** The old/new trace comes from a load of the tool, separate from the load
+of the application, so the two can disagree. In run 42 of the second mode b pilot on ptr_chase the only
+reader of the word traced the old value and the run crashed, which points to the application having read
+the new one (inferred from one run). The fraction of stale reads also depends on the access pattern: 2 of
+31 traced reads in ptr_chase, where each word is read once, against 95% in `tests/l1_probe`, where the same
+word is reread. The cause of the difference is not verified.
+
 ## Shared memory
 
 Shared memory is the working memory of a CTA, addressed as a window of that CTA and
@@ -158,15 +165,53 @@ DUMMY=1 runs show new reads. `ambiguous` occurs in about 1-2 runs of 100 in mode
 
 ## The first launch of a kernel
 
-The first launch of a kernel takes far longer than the kernel, and this inflates every time weight
-that uses the duration of a kernel. In a run with the tool in its timing phase, the first kernel of
-ptr_chase took 1879 us for 57344 instructions and the second 51 us for 1658880. Without the tool,
-shm_stencil launched 5 times took 64-73 us the first time and 7-9 us after that. In the timing phase
-its only kernel took about 1650 us. The cause is presumably the loading of the module, not checked
-further. The instruction clock inside a kernel is not affected.
+The first launch of a kernel takes far longer than the kernel, which inflated every time weight that
+used the duration of a kernel. In the timing phase of the tool, `k_prepare` took 1879 us for 57344
+instructions and `k_walk` 45 us for 1658880.
 
-So in mode b the first kernel of a run gets too many flips, and the windows of shared memory get too
-much weight. To fix before a final campaign.
+`CUDA_MODULE_LOADING=EAGER` does not fix it. Host timer, mean of 10 runs, launch 0 / mean of launches 2-5 (0-based), in us:
+
+| Kernel | No tool, default | No tool, EAGER | Tool, default |
+|---|---:|---:|---:|
+| `k_prepare` | 496 / 6.5 | 837 / 6.2 | 2821 / 8.6 |
+| `k_walk` | 27.5 / 20 | 26.7 / 19 | 48 / 22 |
+| `shm_stencil` | 80 / 6.9 | 23 / 7.0 | 2079 / 10.6 |
+
+nsys could not measure on the GPU side. Nsight Systems 2025.1.3 of CUDA 12.9 runs the applications but
+collects no CUDA activity on this driver: it warns that driver CUDA version 13.0 is not supported and
+CUPTI (NVIDIA's profiling interface) returns `CUPTI_ERROR_INVALID_DEVICE` and
+`CUPTI_ERROR_MULTIPLE_SUBSCRIBERS_NOT_SUPPORTED`. The cause was not established.
+
+So `run_mem_campaign.py profile` measures the kernels on `tests/kernel_timing/repeat_<app>`, a generated
+copy of the workload that repeats each launch. 10 clean runs, no tool, EAGER; the mean of launches 2-5
+(0-based) becomes the duration of the kernel in `kernel-timing.json` and in the `duration` field of
+`mem-profile.json`. The workloads still launch each kernel once. `t0`, `t1` and the gaps stay as
+measured in a single timing run of the tool.
+
+Limits of these durations:
+
+- **They are host times with a floor.** An empty kernel takes 5.73 us (5.0-7.2, launches 2-7 of 5 runs, no
+  tool, EAGER; `tests/kernel_timing/empty_kernel`), close to `k_prepare` (5.8 us) and `shm_stencil` (6.5
+  us). So the weights keep the floor for now and the two cases below bound the result, until there are
+  measurements on the GPU side.
+- **Warm caches.** `k_walk` takes 27 us on its first launch without the tool and 19 us later. How much of
+  this is cold caches is not known.
+- `repeat_gemm` covers gemm; sfu_math launches through a macro and has no copy yet.
+
+Bounds of the time weights (`scripts/mem_time_bounds.py`, no GPU):
+
+| Quantity | Upper bound: as measured (used for the weights) | Lower bound: without the floor |
+|---|---:|---:|
+| `k_prepare` share of mode b weight, ptr_chase | 23.6% | 0.48% |
+| Windows share of the SRAM, shm_stencil | 0.113% | 0.014% |
+| Known part of the AVF on the whole SRAM (AVF 41% x windows) | 0.046% | 0.0057% |
+| Reserved KiB share, not measured | 0.075% | 0.0092% |
+| L1 data share, not reachable | 99.81% | 99.98% |
+
+Neither is a measurement of the kernel. The lower bound subtracts two host times of similar size: for
+`k_prepare` it leaves 0.06 us, within the noise of both, so its share is compatible with zero. The floor
+comes from a 64 x 64 grid, while shm_stencil has 128 x 128, and from 5 runs. The AVF of 41% on the injected
+part does not depend on any of this.
 
 ## Not exercised yet
 
@@ -217,10 +262,10 @@ the chosen one and the SM is the target in 100 of 100 runs, and at the end of th
 have left and no slot is in use.
 
 AVF of shared memory in shm_stencil, from mode u: 41% on the injected part (Wilson 95%: 31.9-50.8).
-On the whole SRAM, as computed: known part 2.5%, from windows 6.1% of bits x time; reserved 4.1%, not
-measured; L1 data 89.9%, not reachable, AVF to be estimated with the beam. **These shares are too high
-for the windows:** see "The first launch of a kernel" below. With the kernel at its real length they
-would be about 0.1% and 0.05% (an estimate). The 41% does not depend on it.
+With the corrected durations, on the whole SRAM: known part 0.046%, from windows 0.113% of bits x time;
+reserved 0.075%, not measured; L1 data 99.81%, not reachable, AVF to be estimated with the beam. The first
+pilot computed 6.1% for the windows, inflated by the first launch. These are the upper bounds: see the
+table in "The first launch of a kernel". The 41% does not depend on it.
 
 Pilot on ptr_chase, global memory, single bit (`logs/mem-pilot-2026-11-04-ptr/`, not a final campaign).
 DUMMY=1, 100 per mode: all Masked, `old_word == new_word`. DUMMY=0, 100 per mode:
@@ -233,10 +278,31 @@ DUMMY=1, 100 per mode: all Masked, `old_word == new_word`. DUMMY=0, 100 per mode
 - All 72 SDCs change only the element of the list or index hit. All 39 crashes have the full record.
 - Mode a: 63 runs flip `nodes` before its first copy, so the copy overwrites them.
 - Mode b: 96 runs flip during `k_prepare`, which does not read `nodes`, and only 4 during `k_walk`, a
-  result of the first launch below. So this pilot says little about stale L1 copies of pointers.
+  result of the first launch below. So this pilot says little about stale L1 copies of pointers: see
+  the second pilot of mode b.
 - High word of `next` in mode b: 22 crashes of 22. Bits 4-9: 3 SDC, 2 timeouts.
 - All 15 `read_masked` flip bits 0-3 of a `value` or `weight`.
 - After a timeout the next run takes the usual 1.04 s.
+
+Second pilot of mode b on ptr_chase, corrected durations (`logs/mem-pilot-2026-11-04-ptr-b-v2/`). DUMMY=1,
+100 runs: all Masked, no new read. DUMMY=0, 100 runs:
+
+| Flip during | Runs | SDC | Crash | Timeout | `no_read` | `overwritten` | `stale_only` | `read_masked` |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `k_prepare` | 18 | 12 | 4 | 0 | 0 | 0 | 0 | 2 |
+| `k_walk` | 82 | 15 | 14 | 0 | 50 | 1 | 1 | 1 |
+| Total | 100 | 27 | 18 | 0 | 50 | 1 | 1 | 3 |
+
+- `no_read` is high because a list is walked once: a flip behind the walking thread is never read.
+- Stale L1 copies of pointers are rare here: of the 31 `k_walk` flips of `nodes` with a traced read, 2
+  returned the old bit and 29 the new one, 28 of these from an SM other than the one that flipped. In
+  `tests/l1_probe` the same word was reread, here each word is read once. Why so few was not investigated.
+- Run 54 (`next` address bit 47): one old read, Masked, `stale_only`. A new value in that bit would be
+  expected to crash, so the load probably did see the old one.
+- Run 42 (`next` address bit 43): one old read, no new read, crash. Only one thread reads that word, so the
+  load of the application probably saw the new value while the load of the tool saw the old one. So the
+  old/new trace can disagree with the application; this is an inference from one run.
+- All 27 SDCs change only the list hit. All 18 crashes have the full record. 0 runs not injected.
 
 Hand-built flips on ptr_chase, as predicted except that bit 3 of `next` gave `illegal memory access`
 (Xid 13 and 43), not `misaligned address`:

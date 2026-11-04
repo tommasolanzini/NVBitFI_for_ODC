@@ -45,6 +45,51 @@ def merge_profiles(timing, count):
 	return merged
 
 
+# From stderr of the runs of tests/kernel_timing/repeat_<app>, lines
+# "LAUNCH <kernel> <index> <us>". The first launches are inflated, see "The first
+# launch of a kernel" in mem_injector/README.md, so only those from index
+# FIRST_CLEAN_LAUNCH on count.
+FIRST_CLEAN_LAUNCH = 2
+
+
+def kernel_timing(run_outputs):
+	us = {}
+	for text in run_outputs:
+		for line in text.splitlines():
+			f = line.split()
+			if len(f) == 4 and f[0] == "LAUNCH" and int(f[2]) >= FIRST_CLEAN_LAUNCH:
+				us.setdefault(f[1], []).append(float(f[3]))
+	return {k: {"launches": len(v), "mean_us": sum(v) / len(v), "min_us": min(v), "max_us": max(v)} for k, v in us.items()}
+
+
+# Durations without the host time of an empty kernel, for a lower bound
+def subtract_floor(timing, floor_us):
+	return {k: dict(v, mean_us=max(v["mean_us"] - floor_us, 0.0)) for k, v in timing.items()}
+
+
+def kernel_short_name(name):
+	return name.split("(")[0]
+
+
+# Sets the duration of each kernel event, in ns. t0 and t1 stay as measured, so
+# the gaps do not change.
+def apply_kernel_timing(events, timing):
+	out = []
+	for e in events:
+		e = dict(e)
+		if e["kind"] == "kernel":
+			name = kernel_short_name(e["name"])
+			if name not in timing:
+				raise ValueError("no measured duration for kernel " + name)
+			e["duration"] = timing[name]["mean_us"] * 1000
+		out.append(e)
+	return out
+
+
+def kernel_ns(e):
+	return e.get("duration", max(e["t1"] - e["t0"], 0))
+
+
 def buffers_of(events):
 	b = {}
 	for e in events:
@@ -71,7 +116,7 @@ def slots_of(events):
 			slots.append({"mode": MODE_BETWEEN, "event": e["e"], "duration": max(e["t0"] - boundary, 0)})
 		if e["kind"] == "kernel":
 			slots.append({"mode": MODE_DURING, "event": e["e"], "kernel": e["k"], "name": e["name"],
-				"instrs": e.get("instrs", 0), "duration": max(e["t1"] - e["t0"], 0)})
+				"instrs": e.get("instrs", 0), "duration": kernel_ns(e)})
 			boundary = e["t1"]
 		else:
 			boundary = e["t0"]
@@ -105,6 +150,19 @@ def exposure(events):
 	return {"between_kernels": out[MODE_BETWEEN], "during_kernels": out[MODE_DURING], "after_last_event": tail_bs,
 		"never_allocated": max(total_gddr - out[MODE_BETWEEN] - out[MODE_DURING] - tail_bs, 0.0),
 		"gddr_total": total_gddr, "run_seconds": duration * 1e-9}
+
+
+# Share of the weight of mode b that falls in each kernel, by name: the weights of sample_targets
+def mode_b_shares(events):
+	buffers = buffers_of(events)
+	weight = {}
+	for s in slots_of(events)[0]:
+		if s["mode"] == MODE_DURING and s["instrs"] > 0:
+			w = sum(b["size"] * s["duration"] for b in buffers.values() if is_live(b, s) and b["size"] >= 4)
+			name = kernel_short_name(s["name"])
+			weight[name] = weight.get(name, 0.0) + w
+	total = sum(weight.values())
+	return {k: v / total if total else 0.0 for k, v in weight.items()}
 
 
 # Targets weighted by bits x lifetime, inside one timing mode. The two modes are
@@ -141,7 +199,7 @@ def kernels_with_shm(events):
 
 # Time a CTA is resident, in ns: its share of the instruction clock of the kernel
 def cta_seconds_ns(kernel, cta):
-	return max(cta[2] - cta[1], 0) / kernel["instrs"] * max(kernel["t1"] - kernel["t0"], 0)
+	return max(cta[2] - cta[1], 0) / kernel["instrs"] * kernel_ns(kernel)
 
 
 def peak_ctas_per_sm(kernel):
@@ -169,6 +227,9 @@ def shared_exposure(events):
 	t0 = min((e["t0"] for e in events), default=0)
 	t_end = max((e["t1"] for e in events), default=0)
 	duration = max(t_end - t0, 0)
+	for e in events: # measured span of each kernel -> its corrected duration
+		if e["kind"] == "kernel":
+			duration += kernel_ns(e) - max(e["t1"] - e["t0"], 0)
 	windows = reserved = 0.0
 	peak = 0
 	for k in kernels_with_shm(events):

@@ -45,9 +45,38 @@ def phase_run(app, base, phase):
 	return mp.load_events(run_dir + "/events.jsonl")
 
 
+# Durations of the kernels: clean runs, no tool, of the copy of the workload that
+# repeats each launch (tests/kernel_timing). The workload itself launches once.
+TIMING_RUNS = 10
+
+
+def measure_kernel_timing(app, base):
+	binary = p.NVBITFI_HOME + "/tests/kernel_timing/repeat_" + app
+	if not os.path.exists(binary):
+		sys.exit(binary + " not found: run make -C tests/kernel_timing")
+	run_dir = base + "/profile-kernel-timing"
+	shutil.rmtree(run_dir, True)
+	os.makedirs(run_dir)
+	env = {k: v for k, v in os.environ.items() if k != "LD_PRELOAD"}
+	env["CUDA_MODULE_LOADING"] = "EAGER"
+	outputs = []
+	for i in range(TIMING_RUNS):
+		r = subprocess.run([binary], cwd=run_dir, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+		if r.returncode != 0:
+			sys.exit("%s failed with exit code %d" % (binary, r.returncode))
+		outputs.append(r.stderr)
+		open("%s/stderr-%d.txt" % (run_dir, i), "w").write(r.stderr)
+	return mp.kernel_timing(outputs)
+
+
 def cmd_profile(a, base):
 	prepare_env(a.app)
+	os.makedirs(base, exist_ok=True)
+	timing = measure_kernel_timing(a.app, base)
+	json.dump(timing, open(base + "/kernel-timing.json", "w"), indent=1)
+	print(json.dumps(timing, indent=1))
 	events = mp.merge_profiles(phase_run(a.app, base, "timing"), phase_run(a.app, base, "count"))
+	events = mp.apply_kernel_timing(events, timing)
 	json.dump(events, open(base + "/mem-profile.json", "w"), indent=1)
 	x = mp.exposure(events)
 	json.dump(x, open(base + "/exposure.json", "w"), indent=1)
