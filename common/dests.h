@@ -49,7 +49,7 @@ static const char *instTypeNames[NUM_OPCODE_COUNTERS] = {
 #undef NVBITFI_OPCODE_GROUP
 
 static const char *instGrouptNames[NUM_INST_GROUPS] = {
-	"fp64", "fp32", "ld", "pr", "nodest", "others", "tc", "sfu", "fp16", "uniform", "unknown", "gppr", "gp"
+	"fp64", "fp32", "ld", "pr", "nodest", "others", "tc", "sfu", "fp16", "uniform", "unknown", "gppr", "gp", "addr"
 };
 
 [[maybe_unused]] static const char *regTypeNames[NUM_REG_TYPES] = { "GPR", "PR", "UR", "UP" };
@@ -308,6 +308,99 @@ inline DestInfo analyze_dests(const std::string &fullOpcode, int opIdx, const st
 	}
 	if (grp == G_PR) { d.gpr_base = -1; d.num_gpr = 0; }
 	return d;
+}
+
+//////////////////////////////////////////////////////////////////////////////
+// Address of a memory instruction: which registers feed it (group G_ADDR)
+//////////////////////////////////////////////////////////////////////////////
+// Bits of an address that can matter, not properties of the register:
+//  - global: 49-bit virtual addresses of NVIDIA GPUs. Assumed, not measured here;
+//    the crashes per bit of the pilot are the check.
+//  - shared: this GPU has 102400 bytes per SM (tests/shm_probe), so 17 bits.
+//  - descriptor: all 64 bits, undocumented (tests/desc_probe).
+static const int GLOBAL_VA_BITS = 49;
+static const int SHARED_ADDR_BITS = 17;
+static const int DESC_BITS = 64;
+
+[[maybe_unused]] static const char *addrPartNames[AP_NUM] = { "ra", "ur", "desc" };
+[[maybe_unused]] static const char *memAccessNames[4] = { "none", "load", "store", "atomic" };
+
+// What a memory operand says, from NVBit's MREF operand or from the SASS text.
+// Register numbers: -1 when absent or a zero register (RZ, URZ).
+struct MrefDesc {
+	int ra = -1;
+	bool ra64 = false;      // Rn.64: pair Rn:Rn+1
+	bool raUnsigned = false; // Rn.U32: zero-extended, otherwise sign-extended
+	int raStride = 1;       // Rn.X4: multiplied by 4
+	int ur = -1;
+	bool ur64 = false;
+	int desc = -1;          // desc[URn]: always a 64-bit pair
+};
+
+struct AddrPart {
+	int reg = -1;  // first register, -1 = absent
+	int sig = 0;   // significant bits, the low ones. Above bit 31: next register
+};
+
+struct AddrInfo {
+	int access = MA_NONE;
+	AddrPart part[AP_NUM];
+	bool ra64 = false, raUnsigned = false, ur64 = false;
+	int raStride = 1;
+	int total_bits() const { return part[AP_RA].sig + part[AP_UR].sig + part[AP_DESC].sig; }
+	std::string str() const {
+		std::stringstream ss;
+		if (part[AP_RA].sig) ss << "R" << part[AP_RA].reg << (ra64 ? ".64" : "") << (raUnsigned ? ".U32" : "") << (raStride != 1 ? ".X" + std::to_string(raStride) : "") << ":" << part[AP_RA].sig << " ";
+		if (part[AP_UR].sig) ss << "UR" << part[AP_UR].reg << (ur64 ? ".64" : "") << ":" << part[AP_UR].sig << " ";
+		if (part[AP_DESC].sig) ss << "desc" << part[AP_DESC].reg << ":" << part[AP_DESC].sig << " ";
+		std::string s = ss.str();
+		return s.empty() ? "-" : s + memAccessNames[access];
+	}
+};
+
+// The opcodes of the address model, by the way they use memory
+inline int mem_access_of(int opIdx) {
+	switch (opIdx) {
+		case LD: case LDG: case LDS: return MA_LOAD;
+		case ST: case STG: case STS: return MA_STORE;
+		case ATOM: case ATOMG: case ATOMS: case RED: return MA_ATOMIC;
+		default: return MA_NONE;
+	}
+}
+
+// Immediate offsets are in the instruction word, not in a register: not reachable.
+inline AddrInfo analyze_addr(int opIdx, const MrefDesc &m) {
+	AddrInfo a;
+	a.access = mem_access_of(opIdx);
+	if (a.access == MA_NONE) return a;
+	const bool shared = (opIdx == LDS || opIdx == STS || opIdx == ATOMS);
+	if (m.ra >= 0 && m.ra < RZ_NUM) {
+		a.ra64 = m.ra64; a.raUnsigned = m.raUnsigned; a.raStride = m.raStride;
+		a.part[AP_RA].reg = m.ra;
+		a.part[AP_RA].sig = shared ? SHARED_ADDR_BITS : (m.ra64 ? GLOBAL_VA_BITS : 32);
+	}
+	if (m.ur >= 0) {
+		a.ur64 = m.ur64;
+		a.part[AP_UR].reg = m.ur;
+		a.part[AP_UR].sig = shared ? SHARED_ADDR_BITS : (m.ur64 ? GLOBAL_VA_BITS : 32);
+	}
+	if (m.desc >= 0) {
+		a.part[AP_DESC].reg = m.desc;
+		a.part[AP_DESC].sig = DESC_BITS;
+	}
+	return a;
+}
+
+// Pack one part into one 32-bit argument of the device calls
+inline uint32_t pack_part(const AddrPart &p) {
+	return p.sig ? (((uint32_t)p.reg << 8) | (uint32_t)p.sig) : 0;
+}
+
+// Does the instruction itself write this register of the address? Then its value
+// after the instruction is the result, and it must not be restored.
+inline bool addr_reg_is_dest(int kind, int reg, const DestInfo &d) {
+	if (kind == AP_RA) return d.num_gpr > 0 && reg >= d.gpr_base && reg < d.gpr_base + d.num_gpr;
+	return d.num_ur > 0 && reg >= d.ur_base && reg < d.ur_base + d.num_ur;
 }
 
 #endif

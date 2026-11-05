@@ -19,6 +19,14 @@ enum { FLIP_NOT_YET = 0, FLIP_RUNNING = 1, FLIP_DONE = 2 };
 // after it. It cannot be told whether the store came before or after the flip.
 enum { ACCESS_NONE = 0, ACCESS_READ = 1, ACCESS_WRITE = 2, ACCESS_AMBIGUOUS = 3 };
 
+// Multi-cell upsets: the words of one injection, and the first bytes of the window
+// of a CTA, reserved by the runtime (cudaDevAttrReservedSharedMemoryPerBlock)
+#define MEM_MAX_CELLS 8
+#define MEM_SHM_RESERVED 1024
+
+// k ones from bit start. Every word of an injection gets the same mask.
+#define MEM_MCU_MASK(k, start) (((k) >= 32 ? 0xffffffffu : ((1u << (k)) - 1)) << (start))
+
 // Flags of an instrumented memory instruction
 enum { MEM_FLAG_LOAD = 1, MEM_FLAG_STORE = 2 };
 
@@ -34,16 +42,21 @@ typedef struct {
 	int fired;                // FLIP_*
 	unsigned int loads;       // loads of the flipped byte seen by the trace, before or after the flip
 	unsigned int smLoads;     // mask of the SMs that made them
-	unsigned int oldWord;     // value of the word before the flip
-	unsigned int mask;        // XOR mask of the flip, one bit
+	unsigned int mask;        // XOR mask of the flip: k adjacent bits, the same in every word
 	unsigned int appliedMask; // mask actually applied: 0 with DUMMY=1
 	unsigned long long instID;       // dynamic instruction that flips (timing mode b)
-	unsigned long long wordAddr;     // address of the 32-bit word
-	unsigned long long flipByteAddr; // address of the byte holding the flipped bit
+	unsigned long long wordAddr;     // address of the first 32-bit word; the others are at cellDelta
+	int numCells;                    // words of this injection, at least 1
+	int cellDelta[MEM_MAX_CELLS];    // their distance in bytes from wordAddr
+	unsigned int cellOld[MEM_MAX_CELLS]; // value of each word before the flip
+	int mcuK;                        // adjacent bits per word
 
 	// Shared memory (modes s and u). The offsets are relative to the shared
-	// window of a CTA. flipCta, flipByteAddr, wordAddr and mask are set by the
-	// flipping thread before FLIP_RUNNING and read with atomics, as fired.
+	// window of a CTA. flipCta, wordAddr and mask are set by the flipping thread
+	// before FLIP_RUNNING and read with atomics, as fired. A word outside
+	// [shmLo, shmHi) is not flipped: mode s only knows its word at run time.
+	unsigned int shmLo;
+	unsigned int shmHi;
 	int applyFlip;            // 0 with DUMMY=1
 	int targetSM;             // mode u: SM of the flip
 	int claimed;              // mode u: a thread took the flip
@@ -80,6 +93,23 @@ typedef struct {
 	int cta[32];
 } mem_sm_t;
 
+// One flipped word and its trace. After a store to the word, loads no longer count:
+// the bit then comes from the application, not from the flip.
+typedef struct {
+	int delta;                 // bytes from the first word
+	int applied;               // flipped: 0 if outside the window of the CTA
+	unsigned int oldWord;
+	unsigned int newWord;
+	unsigned int readsOld;     // device loads that returned the old bits
+	unsigned int readsNew;     // device loads that returned the flipped bits
+	unsigned int writesAfter;  // device stores after the flip
+	unsigned int smOld;        // mask of the SMs that returned the old bits
+	unsigned int smNew;        // mask of the SMs that returned the flipped bits
+	int firstAccess;           // ACCESS_* set by the first device or host access
+	unsigned int hostReads;    // host copies that read the flipped bytes
+	unsigned int hostWrites;   // host copies or memsets that wrote them
+} mem_cell_t;
+
 // Injection record, in host-mapped pinned memory: the host can read it after a
 // kernel error or while a kernel hangs. The device updates the trace counters
 // with atomics and no fence, because a fence invalidates L1 and would destroy
@@ -94,20 +124,12 @@ typedef struct {
 	int smID;
 	int warpID;
 	int laneID;
-	unsigned int oldWord;
-	unsigned int newWord;
 
-	unsigned int readsOld;     // device loads that returned the old bit
-	unsigned int readsNew;     // device loads that returned the flipped bit
-	unsigned int writesAfter;  // device stores after the flip
-	unsigned int smOld;        // mask of the SMs that returned the old bit
-	unsigned int smNew;        // mask of the SMs that returned the flipped bit
-	int firstAccess;           // ACCESS_* set by the first device or host access
-	unsigned int hostReads;    // host copies that read the flipped byte
-	unsigned int hostWrites;   // host copies or memsets that wrote it
+	int numCells;              // words flipped
+	mem_cell_t cells[MEM_MAX_CELLS];
 	unsigned long long readKernels; // bit k: kernel k read the byte after the flip (bit 63: k >= 63)
 	unsigned int shmWordOffset; // shared memory: offset of the flipped word in the window of the CTA
-	unsigned int shmMask;       // shared memory: XOR mask chosen by the flipping thread
+	unsigned int mask;          // XOR mask of each word
 	int residents;              // mode u: CTAs resident on the SM when the CTA was chosen, -1 = not chosen
 	int chosenCta;              // mode u: CTA chosen among them
 	int chosenExits;            // mode u: threads of that CTA already gone at that moment

@@ -107,9 +107,10 @@ G_UNIFORM = 9  # uniform datapath: uniform registers/predicates (UIADD3, LDCU, S
 G_UNKNOWN = 10 # not really an igid: opcodes missing from arch.h, never injected
 G_GPPR = 11    # aggregate: instructions that write a GPR or a predicate register
 G_GP = 12      # aggregate: instructions that write a GPR (original NVBitFI default)
-NUM_INST_GROUPS = 13
+G_ADDR = 13    # aggregate: a register of the address of a memory instruction, corrupted for that instruction only
+NUM_INST_GROUPS = 14
 
-IGID_STR = [ "fp64", "fp32", "ld", "pr", "nodest", "others", "tc", "sfu", "fp16", "uniform", "unknown", "gppr", "gp" ]
+IGID_STR = [ "fp64", "fp32", "ld", "pr", "nodest", "others", "tc", "sfu", "fp16", "uniform", "unknown", "gppr", "gp", "addr" ]
 
 # Register class of the corrupted destination (RegType in arch.h)
 REG_TYPE_STR = [ "GPR", "PR", "UR", "UP" ]
@@ -123,8 +124,25 @@ FLIP_SINGLE_BIT = 0
 FLIP_TWO_BITS = 1
 RANDOM_VALUE = 2
 ZERO_VALUE = 3
+MCU_ADJ_BITS = 4  # k adjacent bits of one register
+MCU_ADJ_REGS = 5  # same bit of k consecutive registers of one thread
+MCU_ADJ_LANES = 6 # same bit of the same register in k adjacent lanes
 
-EM_STR = [ "FLIP_SINGLE_BIT", "FLIP_TWO_BITS", "RANDOM_VALUE", "ZERO_VALUE"]
+EM_STR = [ "FLIP_SINGLE_BIT", "FLIP_TWO_BITS", "RANDOM_VALUE", "ZERO_VALUE", "MCU_ADJ_BITS", "MCU_ADJ_REGS", "MCU_ADJ_LANES"]
+
+# Multi-cell models go in the lists below, and in the file names, as one integer:
+# mcu_bfm(MCU_ADJ_BITS, 3) = 43. Same rule as BFM_MODEL and BFM_K in arch.h.
+def mcu_bfm(model, k):
+	return model * 10 + k
+
+def bfm_model(code):
+	return code if code < 10 else code // 10
+
+def bfm_k(code):
+	return 1 if code < 10 else code % 10
+
+def em_str(code):
+	return EM_STR[bfm_model(code)] + ("" if code < 10 else "_K%d" % bfm_k(code))
 
 rf_inst = ""
 
@@ -210,6 +228,8 @@ inst_value_igid_bfm_map = {
 # 	G_FP16: [FLIP_SINGLE_BIT]
 # 	G_LD: [FLIP_SINGLE_BIT, FLIP_TWO_BITS, RANDOM_VALUE, ZERO_VALUE] 
 # 	G_OTHERS: [FLIP_SINGLE_BIT]
+# 	G_GP: [mcu_bfm(MCU_ADJ_BITS, 3), mcu_bfm(MCU_ADJ_REGS, 2), mcu_bfm(MCU_ADJ_LANES, 4)]  # multi-cell, not for G_ADDR
+# 	G_ADDR: [FLIP_SINGLE_BIT]      # address of memory instructions, restored after the instruction
 }
 
 for _igid in inst_value_igid_bfm_map:

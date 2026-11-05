@@ -7,6 +7,9 @@
 #   run_mem_campaign.py run <app> <dir> --mode a|b|s|u
 #   run_mem_campaign.py one <app> <dir> <file with one target as JSON>
 #   run_mem_campaign.py avf <app> <dir>    AVF of shared memory, from mode u
+#   run_mem_campaign.py rates <app> <dir> --floor-us F   mode b, both bounds of the time weights
+#
+# Multi-cell upsets, at list time: --mcu adj_bits --k 3, or --mcu adj_words --k 2 --step 4
 #
 # Reuses the classification of run_one_injection.py, so that the outcomes mean
 # the same as in the register campaigns. Build first:
@@ -32,8 +35,12 @@ def run_workload(app, run_dir):
 	return subprocess.Popen(cmd, shell=True, executable="/bin/bash", preexec_fn=os.setsid, cwd=run_dir)
 
 
-def phase_run(app, base, phase):
-	run_dir = base + "/profile-" + phase
+def save_hashes(app, base):
+	cf.save_hashes(base + "/config/hashes.jsonl", app, TOOL)
+
+
+def phase_run(app, base, phase, name=None):
+	run_dir = base + "/profile-" + (name or phase)
 	shutil.rmtree(run_dir, True)
 	os.makedirs(run_dir)
 	os.environ["MEMINJ_PHASE"] = phase
@@ -75,7 +82,9 @@ def cmd_profile(a, base):
 	timing = measure_kernel_timing(a.app, base)
 	json.dump(timing, open(base + "/kernel-timing.json", "w"), indent=1)
 	print(json.dumps(timing, indent=1))
-	events = mp.merge_profiles(phase_run(a.app, base, "timing"), phase_run(a.app, base, "count"))
+	save_hashes(a.app, base)
+	runs = [phase_run(a.app, base, "timing", "timing-%d" % i) for i in range(TIMING_RUNS)]
+	events = mp.merge_profiles(mp.mean_timeline(runs), phase_run(a.app, base, "count"))
 	events = mp.apply_kernel_timing(events, timing)
 	json.dump(events, open(base + "/mem-profile.json", "w"), indent=1)
 	x = mp.exposure(events)
@@ -102,6 +111,8 @@ def cmd_list(a, base):
 			targets = mp.sample_after_store(events, a.n, a.seed)
 		else:
 			targets = mp.sample_targets(events, a.mode, a.n, a.seed)
+		if a.mcu:
+			targets = mp.apply_mcu(targets, events, a.mcu, a.k, a.step, a.seed)
 		for i, t in enumerate(targets, 1):
 			t["icount"] = i
 			t["seed"] = a.seed
@@ -113,6 +124,19 @@ def to_int(v, default=-1):
 		return int(v, 0)
 	except (TypeError, ValueError):
 		return default
+
+
+# All the words hit, from the lines
+# "memCell<N>: delta applied old new readsOld readsNew writes first hostReads hostWrites smOld smNew"
+def cells_from_log(log):
+	cells = []
+	for n in range(to_int(log.get("numCells"), 0)):
+		f = log.get("memCell%d" % n, "").split()
+		if len(f) == 12:
+			cells.append({"delta": int(f[0]), "applied": int(f[1]), "old_word": f[2], "new_word": f[3],
+				"reads_old": int(f[4]), "reads_new": int(f[5]), "writes_after": int(f[6]), "first_access": int(f[7]),
+				"host_reads": int(f[8]), "host_writes": int(f[9]), "sms_old": int(f[10], 16), "sms_new": int(f[11], 16)})
+	return cells
 
 
 def record_from_log(log):
@@ -132,12 +156,14 @@ def record_from_log(log):
 		"host_reads": to_int(log.get("hostReads"), 0), "host_writes": to_int(log.get("hostWrites"), 0),
 		"read_kernels": mp.kernels_from_mask(to_int(log.get("readKernels"), 0)),
 		"injected": bool(log.get("errorInjected", False)) and "newWord" in log,
+		"mcu_k_applied": to_int(log.get("mcuK"), 1), "cells_requested_tool": to_int(log.get("cellsRequested"), 1),
+		"cells": cells_from_log(log),
 	}
 	if r["structure"] == "shared":
 		# offset and bit actually flipped: in mode s the thread picks them
 		mask = to_int(log.get("shmMask"), 0)
 		r.update({"target_sm": to_int(log.get("targetSM")), "offset": to_int(log.get("shmWordOffset")),
-			"bit": mask.bit_length() - 1 if mask else -1, "buffer": -1, "buffer_size": -1,
+			"bit": (mask & -mask).bit_length() - 1 if mask else -1, "mask": hex(mask), "buffer": -1, "buffer_size": -1,
 			"unseen_shared_instrs": to_int(log.get("unseenSharedInstrs"), 0),
 			"residents": to_int(log.get("residents")), "chosen_cta": to_int(log.get("chosenCta"))})
 	return r
@@ -155,6 +181,7 @@ def run_target(a, base, t, out_name):
 	roi.stderr_fname = run_dir + "/" + p.stderr_file
 	roi.new_directory = run_dir
 	start = datetime.datetime.now()
+	suspended_before = cf.suspended_seconds()
 	dmesg_before = roi.cmdline("dmesg")
 	cwd = os.getcwd()
 	os.chdir(run_dir)
@@ -172,6 +199,7 @@ def run_target(a, base, t, out_name):
 		"exit_code": retcode, "xids": roi.get_xids(dmesg_delta), "dmesg": dmesg_delta,
 		"cuda_error": roi.get_cuda_error(open(p.inj_run_log).read() if os.path.isfile(p.inj_run_log) else "") or roi.get_cuda_error(open(p.stdout_file).read() if os.path.isfile(p.stdout_file) else ""),
 		"signature": roi.get_signature(a.app),
+		"suspended_s": round(cf.suspended_seconds() - suspended_before, 3),
 		"runtime_s": (datetime.datetime.now() - start).total_seconds()})
 	rec["masked_subclass"] = mp.masked_subclass(rec) if cat in (p.MASKED_OTHER,) else None
 	os.chdir(cwd)
@@ -184,6 +212,7 @@ def run_target(a, base, t, out_name):
 
 def cmd_run(a, base):
 	prepare_env(a.app)
+	save_hashes(a.app, base)
 	out = "results-mode%s.jsonl" % a.mode
 	done = set()
 	if os.path.isfile(base + "/" + out):
@@ -207,19 +236,34 @@ def cmd_avf(a, base):
 	print(json.dumps(x, indent=1))
 
 
+def cmd_rates(a, base):
+	if a.floor_us is None:
+		sys.exit("rates needs --floor-us, the host time of an empty kernel")
+	results = [json.loads(line) for line in open(base + "/results-mode" + mp.MODE_DURING + ".jsonl")]
+	events = json.load(open(base + "/mem-profile.json"))
+	timing = json.load(open(base + "/kernel-timing.json"))
+	x = mp.mode_b_rates(results, events, timing, a.floor_us)
+	json.dump(x, open(base + "/rates-modeb.json", "w"), indent=1)
+	print(json.dumps(x, indent=1))
+
+
 def main():
 	ap = argparse.ArgumentParser()
-	ap.add_argument("command", choices=["profile", "list", "run", "one", "avf"])
+	ap.add_argument("command", choices=["profile", "list", "run", "one", "avf", "rates"])
 	ap.add_argument("app")
 	ap.add_argument("dir")
 	ap.add_argument("target", nargs="?")
 	ap.add_argument("--mode", choices=["a", "b", "s", "u"])
 	ap.add_argument("-n", type=int, default=100)
 	ap.add_argument("--seed", type=int, default=1)
+	ap.add_argument("--mcu", choices=[mp.MCU_ADJ_BITS, mp.MCU_ADJ_WORDS])
+	ap.add_argument("--k", type=int, help="multi-cell size")
+	ap.add_argument("--step", type=int, help="adj_words: bytes between the words")
+	ap.add_argument("--floor-us", type=float)
 	a = ap.parse_args()
 	base = os.path.abspath(a.dir)
 	os.makedirs(base, exist_ok=True)
-	{"profile": cmd_profile, "list": cmd_list, "run": cmd_run, "one": cmd_one, "avf": cmd_avf}[a.command](a, base)
+	{"profile": cmd_profile, "list": cmd_list, "run": cmd_run, "one": cmd_one, "avf": cmd_avf, "rates": cmd_rates}[a.command](a, base)
 
 
 if __name__ == "__main__":

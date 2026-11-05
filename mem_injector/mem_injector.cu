@@ -68,7 +68,9 @@ static struct {
 	int bufferId = -1;
 	size_t bufferSize = 0;
 	size_t offset = 0;       // of the 32-bit word
-	int bit = 0;
+	int bit = 0;             // lowest flipped bit
+	int mcuK = 1;            // adjacent bits per word
+	std::vector<int> deltas; // words, in bytes from the first one: 0, +4, +8, ...
 	long long event = -1;    // mode a: flip on entry of this event
 	int kernel = -1;         // mode b: flip in this kernel
 	std::string kernelName;
@@ -83,8 +85,8 @@ static bool is_shared_mode() { return target.mode == "s" || target.mode == "u"; 
 static int unseen_shared_instrs = 0; // instructions that may reach shared memory without being traced
 
 static bool flip_done = false;      // host view: flip applied (mode a) or kernel of the flip started (mode b)
-static uint64_t flip_byte = 0;
 static uint64_t word_addr = 0;
+static std::vector<int> live_deltas; // the words of target.deltas inside the buffer
 static bool target_freed = false;   // the target buffer has been freed
 
 // Record in host-mapped memory, and its copy in plain host memory taken after
@@ -149,13 +151,15 @@ static void write_record(const mem_shadow_t &r) {
 		fout << "chosenCta: " << r.chosenCta << "\n";
 		if (r.state >= MEM_SELECTED) {
 			fout << "shmWordOffset: " << r.shmWordOffset << "\n";
-			fout << "shmMask: 0x" << std::hex << r.shmMask << std::dec << "\n";
+			fout << "shmMask: 0x" << std::hex << r.mask << std::dec << "\n";
 		}
 	}
 	fout << "bufferId: " << target.bufferId << "\n";
 	fout << "bufferSize: " << target.bufferSize << "\n";
 	fout << "offset: " << target.offset << "\n";
 	fout << "bit: " << target.bit << "\n";
+	fout << "mcuK: " << target.mcuK << "\n";
+	fout << "cellsRequested: " << target.deltas.size() << "\n";
 	fout << "targetEvent: " << target.event << "\n";
 	if (r.state >= MEM_SELECTED) {
 		fout << "flipKernel: " << r.kernelIdx << "\n";
@@ -167,20 +171,32 @@ static void write_record(const mem_shadow_t &r) {
 		fout << "warpID: " << r.warpID << "\n";
 		fout << "laneID: " << r.laneID << "\n";
 	}
-	if (r.state == MEM_INJECTED) {
-		fout << "oldWord: 0x" << std::hex << r.oldWord << "\n";
-		fout << "newWord: 0x" << r.newWord << std::dec << "\n";
+	// Totals over the words; first word for what has no meaningful total
+	const int nc = std::min(r.numCells, MEM_MAX_CELLS);
+	unsigned readsOld = 0, readsNew = 0, writes = 0, smOld = 0, smNew = 0, hostReads = 0, hostWrites = 0;
+	for (int c = 0; c < nc; c++) {
+		const mem_cell_t &e = r.cells[c];
+		readsOld += e.readsOld; readsNew += e.readsNew; writes += e.writesAfter;
+		smOld |= e.smOld; smNew |= e.smNew; hostReads += e.hostReads; hostWrites += e.hostWrites;
+		fout << "memCell" << c << ": " << e.delta << " " << e.applied << std::hex << " 0x" << e.oldWord << " 0x" << e.newWord << std::dec
+			<< " " << e.readsOld << " " << e.readsNew << " " << e.writesAfter << " " << e.firstAccess << " " << e.hostReads << " " << e.hostWrites
+			<< std::hex << " 0x" << e.smOld << " 0x" << e.smNew << std::dec << "\n";
 	}
-	fout << "readsOld: " << r.readsOld << "\n";
-	fout << "readsNew: " << r.readsNew << "\n";
+	fout << "numCells: " << nc << "\n";
+	if (r.state == MEM_INJECTED) {
+		fout << "oldWord: 0x" << std::hex << r.cells[0].oldWord << "\n";
+		fout << "newWord: 0x" << r.cells[0].newWord << std::dec << "\n";
+	}
+	fout << "readsOld: " << readsOld << "\n";
+	fout << "readsNew: " << readsNew << "\n";
 	if (loads_known) fout << "loads: " << loads_seen << "\n"; // managed memory: not available after a crash
-	fout << "writesAfter: " << r.writesAfter << "\n";
-	fout << "smOld: 0x" << std::hex << r.smOld << "\n";
-	fout << "smNew: 0x" << r.smNew << "\n";
+	fout << "writesAfter: " << writes << "\n";
+	fout << "smOld: 0x" << std::hex << smOld << "\n";
+	fout << "smNew: 0x" << smNew << "\n";
 	fout << "smLoads: 0x" << sm_loads_seen << std::dec << "\n";
-	fout << "firstAccess: " << r.firstAccess << "\n";
-	fout << "hostReads: " << r.hostReads << "\n";
-	fout << "hostWrites: " << r.hostWrites << "\n";
+	fout << "firstAccess: " << (nc ? r.cells[0].firstAccess : 0) << "\n";
+	fout << "hostReads: " << hostReads << "\n";
+	fout << "hostWrites: " << hostWrites << "\n";
 	fout << "readKernels: 0x" << std::hex << r.readKernels << std::dec << "\n";
 	if (r.state != MEM_INJECTED) fout << "Error not injected\n";
 	fout.flush();
@@ -218,11 +234,17 @@ static void parse_target() {
 		else if (key == "sm") ifs >> target.sm;
 		else if (key == "shm_offset") ifs >> target.shmOffset;
 		else if (key == "pick") ifs >> target.pick;
+		else if (key == "mcu_k") ifs >> target.mcuK;
+		else if (key == "cell_delta") { int d; ifs >> d; target.deltas.push_back(d); }
 		else { printf("mem_injector: unknown key %s\n", key.c_str()); exit(1); }
 	}
 	assert(target.mode == "a" || target.mode == "b" || is_shared_mode());
 	assert(target.offset % 4 == 0 && target.shmOffset % 4 == 0 && target.bit >= 0);
 	assert(target.mode == "s" || target.bit < 32); // in mode s it only picks a bit of the stored bytes
+	if (target.deltas.empty()) target.deltas.push_back(0);
+	assert(target.deltas.size() <= MEM_MAX_CELLS);
+	assert(target.mcuK >= 1 && target.mcuK <= 32 && (target.mode == "s" || target.bit + target.mcuK <= 32));
+	for (int d : target.deltas) assert(d % 4 == 0);
 }
 
 void nvbit_at_init() {
@@ -258,7 +280,11 @@ static bool resolve_target() {
 	const Buffer &b = buffers[target.bufferId];
 	if (!b.live || b.size != target.bufferSize || target.offset + 4 > b.size) return false;
 	word_addr = b.addr + target.offset;
-	flip_byte = word_addr + target.bit / 8; // little endian
+	live_deltas.clear();
+	for (int d : target.deltas) {
+		const long long off = (long long)target.offset + d;
+		if (off >= 0 && off + 4 <= (long long)b.size) live_deltas.push_back(d);
+	}
 	return true;
 }
 
@@ -267,14 +293,22 @@ static void host_flip() {
 	if (!resolve_target()) return; // the record stays MEM_NONE: "Error not injected"
 	ensure_shadow();
 	cudaDeviceSynchronize();
-	unsigned old = 0;
-	const unsigned applied = DUMMY ? 0u : (1u << target.bit);
+	const unsigned mask = MEM_MCU_MASK(target.mcuK, target.bit);
+	const unsigned applied = DUMMY ? 0u : mask;
 	shadow->state = MEM_SELECTED;
-	if (cudaMemcpy(&old, (const void *)word_addr, 4, cudaMemcpyDeviceToHost) != cudaSuccess) return;
-	const unsigned neu = old ^ applied;
-	shadow->oldWord = old;
-	shadow->newWord = neu;
-	if (applied && cudaMemcpy((void *)word_addr, &neu, 4, cudaMemcpyHostToDevice) != cudaSuccess) return;
+	shadow->mask = mask;
+	shadow->numCells = (int)live_deltas.size();
+	for (size_t i = 0; i < live_deltas.size(); i++) {
+		const uint64_t a = word_addr + (long long)live_deltas[i];
+		unsigned old = 0;
+		if (cudaMemcpy(&old, (const void *)a, 4, cudaMemcpyDeviceToHost) != cudaSuccess) return;
+		const unsigned neu = old ^ applied;
+		shadow->cells[i].delta = live_deltas[i];
+		shadow->cells[i].oldWord = old;
+		shadow->cells[i].newWord = neu;
+		if (applied && cudaMemcpy((void *)a, &neu, 4, cudaMemcpyHostToDevice) != cudaSuccess) return;
+		shadow->cells[i].applied = 1;
+	}
 	shadow->state = MEM_INJECTED;
 	flip_done = true;
 }
@@ -411,10 +445,13 @@ static void instrument(CUcontext ctx, CUfunction func) {
 }
 
 // Host state -> managed memory, only while no kernel runs
+static unsigned shm_hi = 0; // end of the shared window of the running kernel
+
 static void sync_info(bool arm) {
 	cudaDeviceSynchronize();
 	info.armed = arm;
 	info.kernelIdx = kernel_id;
+	info.mcuK = target.mcuK;
 	if (is_shared_mode()) {
 		// the window of a CTA does not outlive the kernel: trace only this one
 		info.traceOn = arm;
@@ -426,20 +463,33 @@ static void sync_info(bool arm) {
 			info.applyFlip = DUMMY ? 0 : 1;
 			info.pickSeed = target.pick;
 			info.chosenCta = CTA_NOT_CHOSEN;
+			info.numCells = (int)target.deltas.size();
+			for (size_t i = 0; i < target.deltas.size(); i++) info.cellDelta[i] = target.deltas[i];
+			info.shmLo = MEM_SHM_RESERVED;
+			info.shmHi = shm_hi;
+			shadow->numCells = info.numCells;
+			for (size_t i = 0; i < target.deltas.size(); i++) shadow->cells[i].delta = target.deltas[i];
 		}
 		cudaDeviceSynchronize();
 		return;
 	}
 	if (word_addr) {
+		const unsigned mask = MEM_MCU_MASK(target.mcuK, target.bit);
 		info.wordAddr = word_addr;
-		info.flipByteAddr = flip_byte;
-		info.mask = 1u << target.bit;
-		info.appliedMask = DUMMY ? 0u : (1u << target.bit);
+		info.mask = mask;
+		info.appliedMask = DUMMY ? 0u : mask;
 		info.instID = target.instID;
+		info.numCells = (int)live_deltas.size();
+		for (size_t i = 0; i < live_deltas.size(); i++) info.cellDelta[i] = live_deltas[i];
+		if (target.mode == "b") {
+			shadow->mask = mask;
+			shadow->numCells = info.numCells;
+			for (size_t i = 0; i < live_deltas.size(); i++) shadow->cells[i].delta = live_deltas[i];
+		}
 	}
 	if (target.mode == "a" && flip_done) {
 		info.fired = FLIP_DONE;
-		info.oldWord = shadow->oldWord;
+		for (size_t i = 0; i < live_deltas.size(); i++) info.cellOld[i] = shadow->cells[i].oldWord;
 		info.traceOn = 1;
 	}
 	if (target.mode == "b" && flip_done) info.traceOn = 1;
@@ -460,6 +510,12 @@ static void on_kernel_entry(CUcontext ctx, nvbit_api_cuda_t cbid, void *params) 
 	if (phase == PHASE_COUNT || target.mode == "u") {
 		memset((void *)cta_table, 0, sizeof(cta_table));
 		memset((void *)sm_table, 0, sizeof(sm_table));
+	}
+
+	{
+		func_config_t cfg;
+		nvbit_get_func_config(ctx, func, &cfg);
+		shm_hi = MEM_SHM_RESERVED + cfg.shmem_static_nbytes + cfg.shmem_dynamic_nbytes;
 	}
 
 	bool arm = false;
@@ -597,15 +653,22 @@ static Range get_range(nvbit_api_cuda_t cbid, void *params) {
 
 static void account_host_access(const Range &r) {
 	if (!flip_done || !word_addr || target_freed || !shadow || shadow->state != MEM_INJECTED) return;
-	const bool rd = r.src && r.src <= flip_byte && flip_byte < r.src + r.size;
-	const bool wr = r.dst && r.dst <= flip_byte && flip_byte < r.dst + r.size;
-	if (rd) {
-		shadow->hostReads = shadow->hostReads + 1;
-		if (shadow->firstAccess == ACCESS_NONE) shadow->firstAccess = ACCESS_READ;
-	}
-	if (wr) {
-		shadow->hostWrites = shadow->hostWrites + 1;
-		if (shadow->firstAccess == ACCESS_NONE) shadow->firstAccess = ACCESS_WRITE;
+	// bytes of the word that hold a flipped bit
+	const unsigned mask = MEM_MCU_MASK(target.mcuK, target.bit);
+	const unsigned lo = __builtin_ctz(mask) / 8, hi = (31 - __builtin_clz(mask)) / 8;
+	for (size_t i = 0; i < live_deltas.size(); i++) {
+		const uint64_t first = word_addr + (long long)live_deltas[i] + lo, last = word_addr + (long long)live_deltas[i] + hi;
+		const bool rd = r.src && r.src <= last && first < r.src + r.size;
+		const bool wr = r.dst && r.dst <= last && first < r.dst + r.size;
+		volatile mem_cell_t &c = shadow->cells[i];
+		if (rd) {
+			c.hostReads = c.hostReads + 1;
+			if (c.firstAccess == ACCESS_NONE) c.firstAccess = ACCESS_READ;
+		}
+		if (wr) {
+			c.hostWrites = c.hostWrites + 1;
+			if (c.firstAccess == ACCESS_NONE) c.firstAccess = ACCESS_WRITE;
+		}
 	}
 }
 

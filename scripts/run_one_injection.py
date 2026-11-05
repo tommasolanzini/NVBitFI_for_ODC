@@ -94,7 +94,7 @@ def record_result(inj_mode, igid, bfm, app, kname, kcount, iid, opid, bid, cat, 
 	# (where: kernel/PC/thread/SM/warp/lane/register; what: model/mask/values;
 	# outcome: category). Written next to the .txt results file.
 	rec = {"app": app, "inj_mode": inj_mode, "igid": int(igid), "group": p.IGID_STR[int(igid)],
-		"bfm": int(bfm), "bfm_str": p.EM_STR[int(bfm)], "icount": int(icount),
+		"bfm": int(bfm), "bfm_str": p.em_str(int(bfm)), "model": p.EM_STR[p.bfm_model(int(bfm))], "k": p.bfm_k(int(bfm)), "icount": int(icount),
 		"kernel": kname, "kcount": int(kcount), "inst_id": int(iid), "op_seed": float(opid), "bit_seed": float(bid),
 		"outcome": cat, "outcome_str": p.CAT_STR[cat-1], "runtime_s": runtime, "dmesg": dmesg}
 	rec.update(inj_log_record)
@@ -165,6 +165,38 @@ def read_inj_log():
 					info[k.strip()] = v.strip()
 		info["errorInjected"] = "Error not injected" not in open(p.inj_run_log, "r").read()
 	return info
+
+# All the registers corrupted, from the lines "cell<N>: regNo lane tid mask before after"
+def get_cells(log):
+	cells = []
+	for n in range(int(log.get("numCells", 0))):
+		f = log.get("cell%d" % n, "").split()
+		if len(f) == 6:
+			cells.append({"reg_no": int(f[0]), "lane": int(f[1]), "tid": int(f[2]), "mask": f[3], "before": f[4], "after": f[5]})
+	return cells
+
+# Fields of the address model. A store that lands in valid memory corrupts another
+# location, with no error: its own class, store_wrong_location.
+def addr_record(log):
+	if "addrPart" not in log:
+		return {}
+	valid = {"1": True, "0": False}.get(log.get("addrValid"))
+	access = log.get("memAccess", "")
+	writes = access in ("store", "atomic")
+	if log["addrPart"] == "desc":
+		cls = "desc_" + access
+	elif writes and valid:
+		cls = access + "_wrong_location"
+	else:
+		cls = access + ("_valid" if valid else "_invalid")
+	r = {"addr_part": log["addrPart"], "addr_bit": int(log.get("addrBit", -1)), "mem_access": access,
+		"addr_space": log.get("addrSpace", ""), "addr_orig": log.get("addrOrig", ""), "addr_new": log.get("addrNew", ""),
+		"addr_valid": valid, "addr_class": cls, "store_wrong_location": bool(writes and valid and log["addrPart"] != "desc"),
+		"addr_restored": log.get("addrRestored") == "1", "addr_overwritten": log.get("addrOverwritten") == "1"}
+	for k_log, k_rec in (("addrOrigBuffer", "addr_orig_buffer"), ("addrOrigOffset", "addr_orig_offset"), ("addrNewBuffer", "addr_new_buffer"), ("addrNewOffset", "addr_new_offset"), ("addrShmLimit", "addr_shm_limit")):
+		if k_log in log:
+			r[k_rec] = int(log[k_log])
+	return r
 
 # CUDA error string printed by the injector when a kernel fails ("" if none).
 # Also matches stdout, where the message is followed by "; ".
@@ -318,6 +350,7 @@ def get_signature(app):
 ###############################################################################
 def run_one_injection_job(inj_mode, igid, bfm, app, kname, kcount, iid, opid, bid, icount):
 	start = datetime.datetime.now() # current time
+	suspended_before = cf.suspended_seconds()
 	[pc, inst_type, tid, injBID, ret_vat] = ["", "", -1, -1, -1]
 
 	shutil.rmtree(new_directory, True)
@@ -355,9 +388,11 @@ def run_one_injection_job(inj_mode, igid, bfm, app, kname, kcount, iid, opid, bi
 		"tid": int(log.get("tid", -1)), "cta": int(log.get("ctaID", -1)), "sm": int(log.get("smID", -1)),
 		"warp_slot": int(log.get("warpID", -1)), "lane": int(log.get("laneID", -1)),
 		"group_instrs": int(log.get("groupInstrs", -1)), "ctas": int(log.get("ctas", -1)),
+		"requested_cells": int(log.get("requestedCells", 0)), "cells": get_cells(log),
 		"exit_code": retcode, "xids": get_xids(dmesg_delta),
 		"cuda_error": get_cuda_error(open(p.inj_run_log).read() if os.path.isfile(p.inj_run_log) else "") or get_cuda_error(open(p.stdout_file).read() if os.path.isfile(p.stdout_file) else ""),
 	}
+	inj_log_record.update(addr_record(log))
 	if timeout_flag:
 		[value_str, pc, inst_type, tid, injBID] = get_inj_info()
 		ret_cat = p.TIMEOUT 
@@ -366,6 +401,7 @@ def run_one_injection_job(inj_mode, igid, bfm, app, kname, kcount, iid, opid, bi
 		ret_cat = classify_injection(app, igid, kname, kcount, iid, opid, bid, retcode, dmesg_delta)
 	
 	inj_log_record["signature"] = get_signature(app)
+	inj_log_record["suspended_s"] = round(cf.suspended_seconds() - suspended_before, 3)
 
 	os.chdir(cwd) # return to the main dir
 	# print (ret_cat)

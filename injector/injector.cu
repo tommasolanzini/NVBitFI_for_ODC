@@ -67,6 +67,51 @@ static std::string target_kname;
 static int target_ctas = -1;
 static bool record_written = false;  // the log gets exactly one record
 
+// Application allocations, to tell where a corrupted address lands
+struct Allocation { uint64_t addr; size_t size; bool live; };
+static std::vector<Allocation> allocations; // in allocation order: ids are stable across runs
+static uint64_t target_shm_limit = 0;       // shared window of the target kernel: reserved + static + dynamic
+static const uint64_t SHM_RESERVED_BYTES = 1024; // cudaDevAttrReservedSharedMemoryPerBlock, tests/shm_probe
+
+static int allocation_of(uint64_t a) {
+	for (size_t i = 0; i < allocations.size(); i++) {
+		if (allocations[i].live && a >= allocations[i].addr && a - allocations[i].addr < allocations[i].size) return (int)i;
+	}
+	return -1;
+}
+
+// Address model: where the original and the corrupted address land. Allocations of
+// the tool or of the CUDA runtime are not tracked: such a hit counts as outside.
+static void write_addr_record() {
+	const int kind = shadow->addrPart;
+	const int access = shadow->memAccess;
+	const uint64_t orig = shadow->addrOrig, neu = shadow->addrNew;
+	const bool shared = shadow->opcode == LDS || shadow->opcode == STS || shadow->opcode == ATOMS;
+	bool valid = false;
+	if (shared) {
+		valid = neu < target_shm_limit;
+		fout << "addrSpace: shared" << std::endl;
+		fout << "addrShmLimit: " << target_shm_limit << std::endl;
+	} else {
+		const int bn = allocation_of(neu), bo = allocation_of(orig);
+		valid = bn >= 0;
+		fout << "addrSpace: global" << std::endl;
+		fout << "addrOrigBuffer: " << bo << std::endl;
+		if (bo >= 0) fout << "addrOrigOffset: " << orig - allocations[bo].addr << std::endl;
+		fout << "addrNewBuffer: " << bn << std::endl;
+		if (bn >= 0) fout << "addrNewOffset: " << neu - allocations[bn].addr << std::endl;
+	}
+	fout << "addrPart: " << addrPartNames[kind] << std::endl;
+	fout << "addrBit: " << shadow->addrBit << std::endl;
+	fout << "memAccess: " << memAccessNames[access] << std::endl;
+	fout << "addrOrig: 0x" << std::hex << orig << std::endl;
+	fout << "addrNew: 0x" << neu << std::dec << std::endl;
+	// the descriptor does not move the address: there is no "other location"
+	fout << "addrValid: " << (kind == AP_DESC ? "na" : (valid ? "1" : "0")) << std::endl;
+	fout << "addrRestored: " << shadow->addrRestored << std::endl;
+	fout << "addrOverwritten: " << shadow->addrOverwritten << std::endl;
+}
+
 void reset_inj_info() {
 	inj_info.areParamsReady = false;
 	inj_info.kernelName[0] = '\0';
@@ -81,6 +126,12 @@ void reset_inj_info() {
 	inj_info.selCtaFlat = -1;
 	inj_info.selTidInCta = -1;
 	inj_info.errorInjected = false;
+	inj_info.mcuK = 1;
+	inj_info.selWarp = -1;
+	inj_info.selLane = -1;
+	inj_info.selLaneMask = 0;
+	inj_info.addrDone = false;
+	inj_info.addrRestore = false;
 	for (int i=0; i<NUM_DEBUG_VALS; i++) {
 		inj_info.debug[i] = -1;
 	}
@@ -119,6 +170,14 @@ void write_inj_record(long long groupInstrs) {
 			fout << "afterVal: 0x" << shadow->afterVal << std::dec << std::endl;
 			fout << "regType: " << regTypeNames[regType] << std::endl;
 			fout << "regNo: " << shadow->regNo << std::endl;
+			fout << "requestedCells: " << shadow->requestedCells << std::endl;
+			const int nc = std::min((int)shadow->numCells, MAX_MCU_CELLS);
+			fout << "numCells: " << nc << std::endl;
+			for (int c = 0; c < nc; c++) {
+				const volatile inj_cell_t &e = shadow->cells[c];
+				fout << "cell" << c << ": " << e.regNo << " " << e.lane << " " << e.tid << std::hex << " 0x" << e.mask << " 0x" << e.before << " 0x" << e.after << std::dec << std::endl;
+			}
+			if (shadow->addrPart >= 0) write_addr_record();
 		}
 	}
 	if (state != SHADOW_INJECTED) {
@@ -152,8 +211,16 @@ void parse_params(std::string filename) {
 			// nothing can be injected in these groups
 			assert(inj_info.groupID != G_NODEST && inj_info.groupID != G_UNKNOWN);
 
-			ifs >> inj_info.bitFlipModel; // fault model: single bit flip, all bit flip, random value
+			int bfmCode;
+			ifs >> bfmCode; // fault model and, for a multi-cell model, its size k: see BFM_MODEL in arch.h
+			inj_info.bitFlipModel = BFM_MODEL(bfmCode);
+			inj_info.mcuK = BFM_K(bfmCode);
 			assert(inj_info.bitFlipModel < NUM_BFM_TYPES); // ensure that the value is in the expected range
+			assert(inj_info.mcuK >= 1 && inj_info.mcuK <= MAX_MCU_CELLS);
+			// a uniform register has one value per warp: it has no lanes
+			assert(inj_info.bitFlipModel != MCU_ADJ_LANES || inj_info.groupID != G_UNIFORM);
+			// the address model flips one bit, of one register, for one instruction
+			assert(inj_info.groupID != G_ADDR || inj_info.bitFlipModel == FLIP_SINGLE_BIT);
 
 			ifs >> inj_info.kernelName;
 			ifs >> inj_info.kernelCount;
@@ -229,6 +296,8 @@ void nvbit_tool_init(CUcontext ctx) {
 	init.laneID = -1;
 	init.regType = -1;
 	init.regNo = -1;
+	init.addrPart = -1;
+	init.memAccess = MA_NONE;
 	memcpy(host_ptr, &init, sizeof(init));
 	shadow = (volatile inj_shadow_t *)host_ptr;
 }
@@ -239,6 +308,7 @@ void nvbit_tool_init(CUcontext ctx) {
 static bool relevant_for_group(const StaticInstInfo &si, int igid) {
 	if (igid == G_GPPR) return si.flags & FLAG_ELIG_GPPR;
 	if (igid == G_GP) return si.flags & FLAG_ELIG_GP;
+	if (igid == G_ADDR) return si.flags & FLAG_ELIG_ADDR;
 	return si.group == igid && (si.flags & FLAG_ELIG_OWN);
 }
 
@@ -287,6 +357,9 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func) {
 		nvbit_get_func_config(ctx, f, &config);
 		fout << "inspecting: " << kname << "\nnum_static_instrs: " << instrs.size() << "\nmaxregs: " << config.num_registers << std::endl;
 
+		const UsedRegs used = used_regs(instrs);
+		fout << "usedGprs: " << used.gpr << "\nusedUrs: " << used.ur << std::endl;
+
 		int num_instrumented = 0;
 		/* We iterate on the vector of instruction */
 		for (auto i : instrs) {
@@ -296,8 +369,8 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func) {
 			num_instrumented++;
 
 			if (verbose) {
-				printf("0x%04x %-10s grp=%-8s dests=%-16s flags=0x%x  %s\n", i->getOffset(),
-						instTypeNames[si.opcode], instGrouptNames[si.group], si.dests.str().c_str(), si.flags, i->getSass());
+				printf("0x%04x %-10s grp=%-8s dests=%-16s addr=%-24s flags=0x%x  %s\n", i->getOffset(),
+						instTypeNames[si.opcode], instGrouptNames[si.group], si.dests.str().c_str(), si.addr.str().c_str(), si.flags, i->getSass());
 			}
 
 			/* BEFORE: count injectable instances and select the target */
@@ -311,6 +384,29 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func) {
 			nvbit_add_call_arg_const_val32(i, si.flags); // eligibility flags
 			nvbit_add_call_arg_guard_pred_val(i); // predicate value
 
+			if (inj_info.groupID == G_ADDR) {
+				/* BEFORE: corrupt one register of the address. AFTER: restore it */
+				nvbit_insert_call(i, "inject_addr_flip", IPOINT_BEFORE);
+				nvbit_add_call_arg_const_val64(i, (uint64_t)&inj_info);
+				nvbit_add_call_arg_const_val64(i, (uint64_t)shadow_device_ptr);
+				nvbit_add_call_arg_mref_addr64(i, 0);
+				nvbit_add_call_arg_const_val32(i, i->getOffset());
+				nvbit_add_call_arg_const_val32(i, pack_part(si.addr.part[AP_RA]));
+				nvbit_add_call_arg_const_val32(i, pack_part(si.addr.part[AP_UR]));
+				nvbit_add_call_arg_const_val32(i, pack_part(si.addr.part[AP_DESC]));
+				nvbit_add_call_arg_const_val32(i, ((uint32_t)si.addr.raStride << 8) | (si.addr.raUnsigned ? 2u : 0u) | (si.addr.ra64 ? 1u : 0u));
+				nvbit_add_call_arg_const_val32(i, si.addr.ur64 ? 1u : 0u);
+				nvbit_add_call_arg_const_val32(i, si.addr.access);
+				nvbit_add_call_arg_const_val32(i, pack_range(si.dests.gpr_base, si.dests.num_gpr));
+				nvbit_add_call_arg_const_val32(i, pack_range(si.dests.ur_base, si.dests.num_ur));
+
+				nvbit_insert_call(i, "inject_addr_restore", IPOINT_AFTER);
+				nvbit_add_call_arg_const_val64(i, (uint64_t)&inj_info);
+				nvbit_add_call_arg_const_val64(i, (uint64_t)shadow_device_ptr);
+				nvbit_add_call_arg_const_val32(i, i->getOffset());
+				continue;
+			}
+
 			/* AFTER: corrupt one destination of the selected instance */
 			nvbit_insert_call(i, "inject_error", IPOINT_AFTER);
 			nvbit_add_call_arg_const_val64(i, (uint64_t)&inj_info);
@@ -321,6 +417,8 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func) {
 			nvbit_add_call_arg_const_val32(i, si.dests.pr_mask);
 			nvbit_add_call_arg_const_val32(i, pack_range(si.dests.ur_base, si.dests.num_ur));
 			nvbit_add_call_arg_const_val32(i, si.dests.up_mask);
+			nvbit_add_call_arg_const_val32(i, used.gpr); // MCU_ADJ_REGS stops here
+			nvbit_add_call_arg_const_val32(i, used.ur);
 			if (si.dests.num_gpr > 0) {
 				nvbit_add_call_arg_reg_val(i, si.dests.gpr_base); // first destination GPR value (sanity check)
 			} else {
@@ -339,6 +437,19 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func) {
  * nvbit_enable_instrumented() before launching the kernel. */
 void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
 		const char *name, void *params, CUresult *pStatus) {
+	if (is_exit && (cbid == API_CUDA_cuMemAlloc_v2 || cbid == API_CUDA_cuMemAllocManaged)) {
+		if (cbid == API_CUDA_cuMemAlloc_v2) {
+			auto p = (cuMemAlloc_v2_params *)params;
+			allocations.push_back({(uint64_t)*p->dptr, p->bytesize, true});
+		} else {
+			auto p = (cuMemAllocManaged_params *)params;
+			allocations.push_back({(uint64_t)*p->dptr, p->bytesize, true});
+		}
+	} else if (is_exit && cbid == API_CUDA_cuMemFree_v2) {
+		const uint64_t a = ((cuMemFree_v2_params *)params)->dptr;
+		for (auto &b : allocations) if (b.live && b.addr == a) b.live = false;
+	}
+
 	/* Identify all the possible CUDA launch events */
 	if (is_kernel_launch(cbid)) {
 		/* CUfunction of the launched kernel (also for cuLaunchKernelEx) */
@@ -359,6 +470,9 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
 				target_index = kernel_id;
 				target_kname = removeSpaces(nvbit_get_func_name(ctx, func));
 				target_ctas = get_num_ctas(cbid, params);
+				func_config_t cfg;
+				nvbit_get_func_config(ctx, func, &cfg);
+				target_shm_limit = SHM_RESERVED_BYTES + cfg.shmem_static_nbytes + cfg.shmem_dynamic_nbytes;
 			}
 			if (verbose) printf("setting areParamsReady=%d, inj_info.kernelCount=%d, kernel_id=%d\n", inj_info.areParamsReady, inj_info.kernelCount, kernel_id);
 			cudaDeviceSynchronize();

@@ -19,6 +19,15 @@ for the second one.
   and host copies are checked in the callbacks. A load overlapping the byte is
   compared with the old and new bit.
 
+- **Multi-cell upsets**, modes a, b, s and u, chosen at list time with `--mcu`:
+  `adj_bits --k K`, k adjacent bits of one word; `adj_words --k K --step S`, the same bit
+  in k words S bytes apart, in a direction drawn per target. S = 4 or 8 for neighbours, any multiple of 4
+  for a row distance. No value is fixed in the code, because the interleaving is not known.
+  A word outside the buffer or the window of the CTA is not flipped: `cells_requested` against `cells`.
+  Each word has its own trace in `cells`; the Masked subclass is the strongest among
+  them, in the order `read_masked`, `ambiguous`, `stale_only`, `overwritten`, `no_read`. Default
+  sizes for weighting afterwards: `scripts/mcu_sizes.py`.
+
 `MEMINJ_PHASE` selects the behaviour: `timing` (no instrumentation, event times),
 `count` (dynamic instructions per kernel), or `inject` (default, one flip).
 Do not prefix the workload with `timeout` in `LD_PRELOAD` runs: the tool also
@@ -152,16 +161,21 @@ DUMMY=1 runs show new reads. `ambiguous` occurs in about 1-2 runs of 100 in mode
   check just before the flip may still return the new value. Pilot: 1 run of 16 with
   1 more wrong element than new reads. The classification of a run changes only if
   that load was the only one to see the flip.
-- **Reads after an overwrite are not meaningful:** the old/new comparison refers to
-  the word before the flip. `first_access` marks these runs.
+- **Reads after a store do not count**, in global as in shared memory: the old/new
+  comparison refers to the word before the flip. Before this rule, 117 false new reads appeared
+  on cnn with DUMMY=1, all in `overwritten` runs. A store by another thread at the same
+  moment can still slip past it. `first_access` marks these runs.
 - **The trace read is an extra load.** It returns what the application sees, but it
   and the instrumentation change timing and L1 contents a little, so stale rates are
   not exactly those of the uninstrumented workload.
 - Only cuMemAlloc-style allocations and instructions in the global or generic memory
   space are traced. Not covered: `cuMemCreate`, arrays, memory pools, surface and
   texture accesses, the CUDA runtime's own memory.
-- Times come from a single timing run. Total run time varied between 2.2 and 6.3 ms in
-  the pilot, so the weights between kernels and between modes are noisy.
+- Times are the mean of 10 timing runs: one alone varied between 2.2 and 6.3 ms in
+  the pilot. The durations of the kernels come from `tests/kernel_timing`.
+- Mode b is sampled with the upper bound of the time weights. `run_mem_campaign.py rates --floor-us F` gives
+  the rates under both bounds, weighting each kernel. A kernel with no runs has no rate: its share is reported, not guessed.
+- `config/hashes.jsonl` has the hashes of tool, workload and golden files, per launch.
 
 ## The first launch of a kernel
 
@@ -330,6 +344,18 @@ Hand-built flips on shm_stencil, as predicted except the last line:
 | first store of the run (mode s) | 3 new reads, row wrong in columns 0-8 |
 | store index beyond the last | not injected |
 | `coef[60]` at instruction 1933000 of SM 0 (predicted `no_read`) | not injected: SM 0 had no CTA left |
+
+Multi-cell pilot, single seed, not final (25 runs per mode and configuration). DUMMY=1, 200 runs: all Masked, no new
+read, `old_word == new_word`, words flipped equal to requested. DUMMY=0, SDC/crash/Masked, both modes together:
+
+| Workload | Adjacent bits k=3 | Words +4 | Words +8 | Words +512 |
+|---|---:|---:|---:|---:|
+| gemm (a, b) | 16/0/34 | 13/0/37 | 12/0/38 | 18/0/32 |
+| ptr_chase (a, b) | 16/13/21 | 10/16/24 | 6/15/29 | 18/4/27, 1 timeout |
+| shm_stencil (s, u) | 37/0/13 | 35/0/15 | | |
+
+No run was left without injection. 181/181 SDCs are at the elements expected from the cells in the record
+(`scripts/check_fault_locations.py`).
 
 ## Run
 

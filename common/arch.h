@@ -30,9 +30,9 @@
 // Instruction groups.
 //
 // Every opcode belongs to exactly ONE "exclusive" group (the hardware unit /
-// datapath that produces its result). G_GPPR and G_GP are "aggregate" groups
-// defined by the destination operands, not by the opcode; they MUST stay the
-// last two entries (counters[NUM_COUNTERS-2] and counters[NUM_COUNTERS-1]).
+// datapath that produces its result). G_GPPR, G_GP and G_ADDR are "aggregate"
+// groups defined by the operands, not by the opcode. Their ids are stable: new
+// groups go at the end, so that old results keep their meaning.
 //
 // Injectable destinations per group (see common/dests.h):
 //  - exclusive groups      : every destination register of the instruction
@@ -43,6 +43,9 @@
 //                            known opcode
 //  - G_GP                  : GPR destinations only (original NVBitFI default)
 //  - G_NODEST              : nothing (never selected for injection)
+//  - G_ADDR                : not a destination: a source register of the address
+//                            of a memory instruction, corrupted for that
+//                            instruction only (see analyze_addr in dests.h)
 //////////////////////////////////////////////////////////////////////////////
 enum GroupType {
 	G_FP64 = 0,  // FP64 arithmetic (DADD, DFMA, DMUL, ...)
@@ -58,6 +61,7 @@ enum GroupType {
 	G_UNKNOWN,   // opcode not in the table below: counted, never injected (add it to the table!)
 	G_GPPR,      // aggregate: writes a GPR or a predicate register
 	G_GP,        // aggregate: writes a GPR
+	G_ADDR,      // aggregate: memory instruction with a register in its address
 	NUM_INST_GROUPS
 };
 
@@ -198,6 +202,7 @@ enum RegType {
 #define FLAG_ELIG_GPPR  0x2  // counted in G_GPPR (writes a GPR or a PR)
 #define FLAG_ELIG_GP    0x4  // counted in G_GP (writes a GPR)
 #define FLAG_UNIFORM    0x8  // uniform-datapath instruction: executes once per warp
+#define FLAG_ELIG_ADDR  0x10 // counted in G_ADDR (register in the address of a memory instruction)
 
 // List of the Bit Flip Models
 // For 1-bit destinations (predicates) FLIP_SINGLE_BIT and FLIP_TWO_BITS both
@@ -207,7 +212,25 @@ enum BitFlipModel {
 	FLIP_TWO_BITS, // flip two adjacent bits
 	RANDOM_VALUE,  // write a random value.
 	ZERO_VALUE, // write value 0
+	// Multi-cell upsets, size k. Predicate registers: k adjacent bits of P0-P6 (or
+	// UP0-UP6) around the destination, for MCU_ADJ_BITS and MCU_ADJ_REGS.
+	MCU_ADJ_BITS,  // k adjacent bits of one register (FLIP_TWO_BITS is k = 2)
+	MCU_ADJ_REGS,  // same bit of k consecutive registers of one thread: Rn, Rn+1, ...
+	MCU_ADJ_LANES, // same bit of the same register in k adjacent lanes of the warp
 	NUM_BFM_TYPES
 };
+
+// Address of a memory instruction (G_ADDR): how it uses memory, and the register
+// parts: [Rn], [UR], desc[UR]
+enum MemAccess { MA_NONE = 0, MA_LOAD = 1, MA_STORE = 2, MA_ATOMIC = 3 };
+enum AddrPartKind { AP_RA = 0, AP_UR = 1, AP_DESC = 2, AP_NUM = 3 };
+
+// Most cells written by one injection
+#define MAX_MCU_CELLS 8
+
+// On the command line and in the file names one integer carries model and size:
+// model below 10 = the model alone, otherwise model * 10 + k (43 = MCU_ADJ_BITS, k = 3)
+#define BFM_MODEL(code) ((code) < 10 ? (code) : (code) / 10)
+#define BFM_K(code) ((code) < 10 ? 1 : (code) % 10)
 
 #endif

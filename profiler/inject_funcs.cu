@@ -45,7 +45,9 @@ extern "C" __device__ __noinline__ void count_instrs(uint64_t pcounters, int opc
 	if (flags & FLAG_ELIG_OWN)
 		atomicAdd((unsigned long long *)&counters[NUM_OPCODE_COUNTERS+grp], n);
 	if (flags & FLAG_ELIG_GPPR)
-		atomicAdd((unsigned long long *)&counters[NUM_COUNTERS-2], n);
+		atomicAdd((unsigned long long *)&counters[NUM_OPCODE_COUNTERS+G_GPPR], n);
 	if (flags & FLAG_ELIG_GP)
-		atomicAdd((unsigned long long *)&counters[NUM_COUNTERS-1], n);
+		atomicAdd((unsigned long long *)&counters[NUM_OPCODE_COUNTERS+G_GP], n);
+	if (flags & FLAG_ELIG_ADDR)
+		atomicAdd((unsigned long long *)&counters[NUM_OPCODE_COUNTERS+G_ADDR], n);
 }

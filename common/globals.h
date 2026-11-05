@@ -140,8 +140,9 @@ std::string removeSpaces(const char * str) {
 // per-instruction "static info" passed to the device functions.
 //////////////////////////////////////////////////////////////////////////////////
 
-inline uint32_t eligibility_flags(int grp, const DestInfo &d) {
+inline uint32_t eligibility_flags(int grp, const DestInfo &d, const AddrInfo &a) {
 	uint32_t f = 0;
+	if (a.total_bits() > 0) f |= FLAG_ELIG_ADDR;
 	if (grp == G_UNIFORM) f |= FLAG_UNIFORM;
 	if (grp == G_NODEST || grp == G_UNKNOWN) {
 		f |= FLAG_ELIG_OWN; // counted (statistics only), never injected
@@ -207,12 +208,40 @@ inline std::vector<OpDesc> nvbit_operands(Instr *i) {
 	return v;
 }
 
+// The memory operand of an instruction, from NVBit's MREF and MEM_DESC operands.
+// Zero registers are recognised by name, as for the destinations.
+inline MrefDesc nvbit_mref(Instr *i) {
+	MrefDesc m;
+	for (int k = 0; k < i->getNumOperands(); k++) {
+		const InstrType::operand_t *op = i->getOperand(k);
+		if (op->type == InstrType::OperandType::MEM_DESC) {
+			m.desc = op->u.mem_desc.ureg_num;
+		} else if (op->type == InstrType::OperandType::MREF) {
+			const std::string s = op->str;
+			if (op->u.mref.has_ra && s.find("[RZ") == std::string::npos && op->u.mref.ra_num != InstrType::RZ) {
+				const InstrType::RegModifierType mod = op->u.mref.ra_mod;
+				m.ra = op->u.mref.ra_num;
+				m.ra64 = (mod == InstrType::RegModifierType::U64);
+				m.raUnsigned = (mod == InstrType::RegModifierType::U32);
+				m.raStride = mod == InstrType::RegModifierType::X4 ? 4 : mod == InstrType::RegModifierType::X8 ? 8 : mod == InstrType::RegModifierType::X16 ? 16 : 1;
+			}
+			if (op->u.mref.has_ur && s.find("URZ") == std::string::npos) {
+				m.ur = op->u.mref.ur_num;
+				m.ur64 = (op->u.mref.ur_mod == InstrType::RegModifierType::U64);
+			}
+			if (op->u.mref.has_desc) m.desc = op->u.mref.desc_ureg_num;
+		}
+	}
+	return m;
+}
+
 // Static information about one SASS instruction, computed once at
 // instrumentation time and passed to the device functions as constants.
 struct StaticInstInfo {
 	int opcode;        // index in the opcode table (UNKNOWN_OPCODE if not found)
 	int group;         // exclusive group
 	DestInfo dests;    // destination registers
+	AddrInfo addr;     // registers of the address, for a memory instruction
 	uint32_t flags;    // FLAG_* bits
 };
 
@@ -222,8 +251,33 @@ inline StaticInstInfo analyze_instr(Instr *i) {
 	si.opcode = opcode_index(short_opcode(full));
 	si.group = opcode_group(si.opcode);
 	si.dests = analyze_dests(full, si.opcode, nvbit_operands(i));
-	si.flags = eligibility_flags(si.group, si.dests);
+	si.addr = analyze_addr(si.opcode, nvbit_mref(i));
+	si.flags = eligibility_flags(si.group, si.dests, si.addr);
 	return si;
+}
+
+// One past the highest GPR and UR named by the instructions of a function, from
+// the decoded operands and destinations. MCU_ADJ_REGS stops here, not at
+// func_config_t::num_registers: on gemm_core that says 40, the code uses up to R37,
+// and two DUMMY=1 runs that read R38 ended in "illegal instruction".
+struct UsedRegs { int gpr = 0; int ur = 0; };
+
+inline UsedRegs used_regs(const std::vector<Instr *> &instrs) {
+	UsedRegs u;
+	for (Instr *i : instrs) {
+		for (const OpDesc &op : nvbit_operands(i)) {
+			if (op.kind == OK_REG && op.num >= 0 && op.num < RZ_NUM) u.gpr = std::max(u.gpr, (int)op.num + 1);
+			if (op.kind == OK_UREG && op.num >= 0 && op.num < MAX_UR) u.ur = std::max(u.ur, (int)op.num + 1);
+		}
+		const StaticInstInfo si = analyze_instr(i);
+		if (si.dests.num_gpr) u.gpr = std::max(u.gpr, si.dests.gpr_base + si.dests.num_gpr);
+		if (si.dests.num_ur) u.ur = std::max(u.ur, si.dests.ur_base + si.dests.num_ur);
+		const MrefDesc m = nvbit_mref(i);
+		if (m.ra >= 0 && m.ra < RZ_NUM) u.gpr = std::max(u.gpr, m.ra + (m.ra64 ? 2 : 1));
+		if (m.ur >= 0) u.ur = std::max(u.ur, m.ur + (m.ur64 ? 2 : 1));
+		if (m.desc >= 0) u.ur = std::max(u.ur, m.desc + 2);
+	}
+	return u;
 }
 
 // Report (once per opcode) SASS opcodes that are missing from the table in

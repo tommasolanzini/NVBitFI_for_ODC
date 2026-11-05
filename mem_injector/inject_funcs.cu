@@ -4,7 +4,7 @@
  *  mem_count_flip counts the dynamic instructions of the target kernel. The
  *    thread that reaches the selected one flips the word with atomicXor.
  *  mem_trace_access checks every global load and store against the flipped
- *    byte. On an overlap with a load it reads the word just before the
+ *    bytes of each word. On an overlap with a load it reads the word just before the
  *    instruction, with a plain load: same path as the application, so it sees
  *    what the application sees, stale L1 copies included.
  *
@@ -24,6 +24,31 @@ __inline__ __device__ int flat_tid_in_cta() {
 
 __inline__ __device__ int flat_cta() {
 	return blockIdx.x + (gridDim.x * (blockIdx.y + (blockIdx.z * gridDim.y)));
+}
+
+// First and last byte of a word with a bit of the mask
+__inline__ __device__ unsigned first_byte(unsigned mask) { return (unsigned)(__ffs(mask) - 1) / 8; }
+__inline__ __device__ unsigned last_byte(unsigned mask) { return (unsigned)(31 - __clz(mask)) / 8; }
+
+__inline__ __device__ void count_read(mem_info_t *info, mem_shadow_t *rec, mem_cell_t *c, int i, unsigned v, unsigned mask, unsigned smBit) {
+	const unsigned old = atomicAdd(&info->cellOld[i], 0u);
+	atomicCAS(&c->firstAccess, ACCESS_NONE, ACCESS_READ);
+	if ((v ^ old) & mask) {
+		atomicAdd(&c->readsNew, 1u);
+		atomicOr(&c->smNew, smBit);
+	} else {
+		atomicAdd(&c->readsOld, 1u);
+		atomicOr(&c->smOld, smBit);
+	}
+	const int k = info->kernelIdx;
+	atomicOr(&rec->readKernels, 1ull << (k < 63 ? k : 63));
+}
+
+// After a store to the word the bits no longer come from the flip: comparing them
+// would count data of the application as old or new reads.
+__inline__ __device__ bool still_flipped(mem_cell_t *c) {
+	const int first = atomicAdd(&c->firstAccess, 0);
+	return first != ACCESS_WRITE && first != ACCESS_AMBIGUOUS && atomicAdd(&c->writesAfter, 0u) == 0;
 }
 
 extern "C" __device__ __noinline__ void mem_count_flip(uint64_t pinfo, uint64_t pshadow, uint64_t pcounter,
@@ -64,12 +89,19 @@ extern "C" __device__ __noinline__ void mem_count_flip(uint64_t pinfo, uint64_t 
 	// The readers wait while FLIP_RUNNING. The slow writes to host memory come
 	// after FLIP_DONE, so that the readers do not wait for them.
 	atomicExch(&info->fired, FLIP_RUNNING);
-	const unsigned old = atomicXor((unsigned *)info->wordAddr, info->appliedMask);
-	atomicExch(&info->oldWord, old);
+	const int n = info->numCells;
+	for (int i = 0; i < n; i++) {
+		const unsigned old = atomicXor((unsigned *)(info->wordAddr + (long long)info->cellDelta[i]), info->appliedMask);
+		atomicExch(&info->cellOld[i], old);
+	}
 	atomicExch(&info->fired, FLIP_DONE);
 
-	rec->oldWord = old;
-	rec->newWord = old ^ info->appliedMask;
+	for (int i = 0; i < n; i++) {
+		const unsigned old = atomicAdd(&info->cellOld[i], 0u);
+		rec->cells[i].oldWord = old;
+		rec->cells[i].newWord = old ^ info->appliedMask;
+		rec->cells[i].applied = 1;
+	}
 	__threadfence_system();
 	rec->state = MEM_INJECTED;
 	__threadfence_system();
@@ -79,8 +111,16 @@ extern "C" __device__ __noinline__ void mem_trace_access(uint64_t pinfo, uint64_
 		uint64_t addr, int size, int flags) {
 	mem_info_t *info = (mem_info_t *)pinfo;
 	if (!predicate || !info->traceOn) return;
-	const uint64_t flip = info->flipByteAddr;
-	if (addr > flip || addr + size <= flip) return;
+	const unsigned mask = info->mask;
+	const unsigned lo = first_byte(mask), hi = last_byte(mask);
+	const uint64_t word0 = info->wordAddr;
+	const int n = info->numCells;
+	unsigned hit = 0;
+	for (int i = 0; i < n; i++) {
+		const uint64_t w = word0 + (long long)info->cellDelta[i];
+		if (addr <= w + hi && addr + size > w + lo) hit |= 1u << i;
+	}
+	if (!hit) return;
 
 	mem_shadow_t *rec = (mem_shadow_t *)pshadow;
 	const unsigned smBit = 1u << (get_smid() & 31);
@@ -96,23 +136,17 @@ extern "C" __device__ __noinline__ void mem_trace_access(uint64_t pinfo, uint64_
 	for (int spins = 0; fired == FLIP_RUNNING && spins < 100000; spins++) fired = atomicAdd(&info->fired, 0);
 	if (fired == FLIP_NOT_YET) return;
 
-	if (flags & MEM_FLAG_LOAD) {
-		const unsigned v = *(const unsigned *)info->wordAddr;
-		const unsigned old = atomicAdd(&info->oldWord, 0u);
-		atomicCAS(&rec->firstAccess, ACCESS_NONE, ACCESS_READ);
-		if ((v ^ old) & info->mask) {
-			atomicAdd(&rec->readsNew, 1u);
-			atomicOr(&rec->smNew, smBit);
-		} else {
-			atomicAdd(&rec->readsOld, 1u);
-			atomicOr(&rec->smOld, smBit);
+	for (int i = 0; i < n; i++) {
+		if (!(hit >> i & 1)) continue;
+		mem_cell_t *c = &rec->cells[i];
+		if ((flags & MEM_FLAG_LOAD) && still_flipped(c)) {
+			const unsigned v = *(const unsigned *)(word0 + (long long)info->cellDelta[i]);
+			count_read(info, rec, c, i, v, mask, smBit);
 		}
-		const int k = info->kernelIdx;
-		atomicOr(&rec->readKernels, 1ull << (k < 63 ? k : 63));
-	}
-	if (flags & MEM_FLAG_STORE) {
-		atomicCAS(&rec->firstAccess, ACCESS_NONE, ACCESS_WRITE);
-		atomicAdd(&rec->writesAfter, 1u);
+		if (flags & MEM_FLAG_STORE) {
+			atomicCAS(&c->firstAccess, ACCESS_NONE, ACCESS_WRITE);
+			atomicAdd(&c->writesAfter, 1u);
+		}
 	}
 }
 
@@ -141,7 +175,11 @@ extern "C" __device__ __noinline__ void shm_residency(uint64_t ptable, uint64_t 
 	e->sm = get_smid();
 }
 
-__inline__ __device__ void shm_do_flip(mem_info_t *info, mem_shadow_t *r, unsigned word_off, unsigned byte_off,
+__inline__ __device__ bool shm_cell_inside(mem_info_t *info, unsigned word) {
+	return word >= info->shmLo && word + 4 <= info->shmHi;
+}
+
+__inline__ __device__ void shm_do_flip(mem_info_t *info, mem_shadow_t *r, unsigned word_off,
 		unsigned mask, unsigned long long idx, int offset, int lane) {
 	volatile mem_shadow_t *rec = (volatile mem_shadow_t *)r;
 	rec->kernelIdx = info->kernelIdx;
@@ -153,23 +191,31 @@ __inline__ __device__ void shm_do_flip(mem_info_t *info, mem_shadow_t *r, unsign
 	rec->warpID = get_warpid();
 	rec->laneID = lane;
 	rec->shmWordOffset = word_off;
-	rec->shmMask = mask;
+	rec->mask = mask;
 	__threadfence_system();
 	rec->state = MEM_SELECTED;
 	__threadfence_system();
 
 	atomicExch(&info->wordAddr, (unsigned long long)word_off);
-	atomicExch(&info->flipByteAddr, (unsigned long long)byte_off);
 	atomicExch(&info->mask, mask);
 	atomicExch(&info->flipCta, flat_cta());
 	atomicExch(&info->fired, FLIP_RUNNING);
 	const unsigned applied = info->applyFlip ? mask : 0u;
-	const unsigned old = atomicXor((unsigned *)__cvta_shared_to_generic(word_off), applied);
-	atomicExch(&info->oldWord, old);
+	const int n = info->numCells;
+	for (int i = 0; i < n; i++) {
+		const unsigned w = word_off + info->cellDelta[i];
+		if (!shm_cell_inside(info, w)) continue;
+		atomicExch(&info->cellOld[i], atomicXor((unsigned *)__cvta_shared_to_generic(w), applied));
+	}
 	atomicExch(&info->fired, FLIP_DONE);
 
-	rec->oldWord = old;
-	rec->newWord = old ^ applied;
+	for (int i = 0; i < n; i++) {
+		if (!shm_cell_inside(info, word_off + info->cellDelta[i])) continue;
+		const unsigned old = atomicAdd(&info->cellOld[i], 0u);
+		rec->cells[i].oldWord = old;
+		rec->cells[i].newWord = old ^ applied;
+		rec->cells[i].applied = 1;
+	}
 	__threadfence_system();
 	rec->state = MEM_INJECTED;
 	__threadfence_system();
@@ -193,7 +239,10 @@ extern "C" __device__ __noinline__ void shm_flip_after_store(uint64_t pinfo, uin
 
 	const unsigned bit = info->bitSeed % ((unsigned)size * 8);
 	const unsigned byte_off = (unsigned)addr + bit / 8;
-	shm_do_flip(info, (mem_shadow_t *)pshadow, byte_off & ~3u, byte_off, 1u << ((byte_off & 3) * 8 + bit % 8), myIdx, offset, lane);
+	// k adjacent bits from the chosen one, inside the word
+	const int k = info->mcuK;
+	const int start = min((int)((byte_off & 3) * 8 + bit % 8), 32 - k);
+	shm_do_flip(info, (mem_shadow_t *)pshadow, byte_off & ~3u, MEM_MCU_MASK(k, start), myIdx, offset, lane);
 }
 
 // Mode u: registers a CTA at the first instruction of the kernel, and counts the
@@ -277,8 +326,7 @@ extern "C" __device__ __noinline__ void shm_flip_uniform(uint64_t pinfo, uint64_
 	}
 	if (chosen != flat_cta()) return;
 	if (atomicCAS(&info->claimed, 0, 1) != 0) return;
-	const unsigned word_off = (unsigned)info->flipOffsetTarget;
-	shm_do_flip(info, (mem_shadow_t *)pshadow, word_off, word_off + info->bitSeed / 8, 1u << info->bitSeed, base, offset, lane);
+	shm_do_flip(info, (mem_shadow_t *)pshadow, (unsigned)info->flipOffsetTarget, MEM_MCU_MASK(info->mcuK, info->bitSeed), base, offset, lane);
 }
 
 // After a store. If the flip came while the store was between its check in
@@ -290,12 +338,19 @@ extern "C" __device__ __noinline__ void shm_trace_store_after(uint64_t pinfo, ui
 	if (!predicate || !info->traceOn) return;
 	if (atomicAdd(&info->fired, 0) != FLIP_DONE) return;
 	if (flat_cta() != atomicAdd(&info->flipCta, 0)) return;
-	const unsigned long long flip = atomicAdd(&info->flipByteAddr, 0ull);
-	if (addr > flip || addr + size <= flip) return;
-	atomicCAS(&((mem_shadow_t *)pshadow)->firstAccess, ACCESS_NONE, ACCESS_AMBIGUOUS);
+	const unsigned word0 = (unsigned)atomicAdd(&info->wordAddr, 0ull);
+	const unsigned mask = atomicAdd(&info->mask, 0u);
+	const unsigned lo = first_byte(mask), hi = last_byte(mask);
+	mem_shadow_t *rec = (mem_shadow_t *)pshadow;
+	const int n = info->numCells;
+	for (int i = 0; i < n; i++) {
+		const unsigned w = word0 + info->cellDelta[i];
+		if (shm_cell_inside(info, w) && addr <= w + hi && addr + size > w + lo)
+			atomicCAS(&rec->cells[i].firstAccess, ACCESS_NONE, ACCESS_AMBIGUOUS);
+	}
 }
 
-// The readers of the flipped word: same CTA only. Shared memory has no L1 copy,
+// The readers of the flipped words: same CTA only. Shared memory has no L1 copy,
 // so all of them should see the new value; this measures it.
 extern "C" __device__ __noinline__ void shm_trace_access(uint64_t pinfo, uint64_t pshadow, int predicate,
 		uint64_t addr, int size, int flags) {
@@ -305,32 +360,24 @@ extern "C" __device__ __noinline__ void shm_trace_access(uint64_t pinfo, uint64_
 	for (int spins = 0; fired == FLIP_RUNNING && spins < 100000; spins++) fired = atomicAdd(&info->fired, 0);
 	if (fired != FLIP_DONE) return;
 	if (flat_cta() != atomicAdd(&info->flipCta, 0)) return;
-	const unsigned long long flip = atomicAdd(&info->flipByteAddr, 0ull);
-	if (addr > flip || addr + size <= flip) return;
+	const unsigned word0 = (unsigned)atomicAdd(&info->wordAddr, 0ull);
+	const unsigned mask = atomicAdd(&info->mask, 0u);
+	const unsigned lo = first_byte(mask), hi = last_byte(mask);
 
 	mem_shadow_t *rec = (mem_shadow_t *)pshadow;
 	const unsigned smBit = 1u << (get_smid() & 31);
-	// After a store to the byte the bit no longer comes from the flip: comparing
-	// it would count data of the application as old or new reads.
-	const int first = atomicAdd(&rec->firstAccess, 0);
-	if ((flags & MEM_FLAG_LOAD) && first != ACCESS_WRITE && first != ACCESS_AMBIGUOUS && atomicAdd(&rec->writesAfter, 0u) == 0) {
-		const unsigned word = (unsigned)atomicAdd(&info->wordAddr, 0ull);
-		const unsigned v = *(const unsigned *)__cvta_shared_to_generic(word);
-		const unsigned old = atomicAdd(&info->oldWord, 0u);
-		const unsigned mask = atomicAdd(&info->mask, 0u);
-		atomicCAS(&rec->firstAccess, ACCESS_NONE, ACCESS_READ);
-		if ((v ^ old) & mask) {
-			atomicAdd(&rec->readsNew, 1u);
-			atomicOr(&rec->smNew, smBit);
-		} else {
-			atomicAdd(&rec->readsOld, 1u);
-			atomicOr(&rec->smOld, smBit);
+	const int n = info->numCells;
+	for (int i = 0; i < n; i++) {
+		const unsigned w = word0 + info->cellDelta[i];
+		if (!shm_cell_inside(info, w) || addr > w + hi || addr + size <= w + lo) continue;
+		mem_cell_t *c = &rec->cells[i];
+		if ((flags & MEM_FLAG_LOAD) && still_flipped(c)) {
+			const unsigned v = *(const unsigned *)__cvta_shared_to_generic(w);
+			count_read(info, rec, c, i, v, mask, smBit);
 		}
-		const int k = info->kernelIdx;
-		atomicOr(&rec->readKernels, 1ull << (k < 63 ? k : 63));
-	}
-	if (flags & MEM_FLAG_STORE) {
-		atomicCAS(&rec->firstAccess, ACCESS_NONE, ACCESS_WRITE);
-		atomicAdd(&rec->writesAfter, 1u);
+		if (flags & MEM_FLAG_STORE) {
+			atomicCAS(&c->firstAccess, ACCESS_NONE, ACCESS_WRITE);
+			atomicAdd(&c->writesAfter, 1u);
+		}
 	}
 }

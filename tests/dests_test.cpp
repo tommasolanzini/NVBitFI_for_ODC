@@ -53,6 +53,94 @@ static DestInfo dests_of(const std::string &line) {
 	return analyze_dests(opc, opcode_index(short_opcode(opc)), ops);
 }
 
+// Memory operand from the SASS text, what NVBit's MREF and MEM_DESC operands say
+static MrefDesc mref_of(const std::string &line) {
+	MrefDesc m;
+	std::smatch s;
+	std::string rest = line;
+	static const std::regex desc("desc\\[UR(\\d+)\\]");
+	if (std::regex_search(rest, s, desc)) { m.desc = std::stoi(s[1]); rest = s.suffix(); }
+	static const std::regex mem("\\[([^\\]]*)\\]");
+	if (!std::regex_search(rest, s, mem)) return m;
+	std::stringstream parts(s[1].str());
+	std::string t;
+	while (std::getline(parts, t, '+')) {
+		std::smatch r;
+		if (std::regex_match(t, r, std::regex("R(\\d+)(\\.(64|U32|X4|X8|X16))?"))) {
+			m.ra = std::stoi(r[1]);
+			const std::string mod = r[3];
+			m.ra64 = mod == "64"; m.raUnsigned = mod == "U32";
+			m.raStride = mod == "X4" ? 4 : mod == "X8" ? 8 : mod == "X16" ? 16 : 1;
+		} else if (std::regex_match(t, r, std::regex("UR(\\d+)(\\.64)?"))) {
+			m.ur = std::stoi(r[1]);
+			m.ur64 = r[2].matched;
+		}
+	}
+	return m;
+}
+
+static int check_addr() {
+	struct { const char *sass, *expect; } cases[] = {
+		{"LDG.E R20, desc[UR14][R22.64+0x10]", "R22.64:49 desc14:64 load"},
+		{"LDG.E R15, desc[UR6][R6.64+-0x10]", "R6.64:49 desc6:64 load"},
+		{"STG.E.64 desc[UR14][R2.64], R12", "R2.64:49 desc14:64 store"},
+		{"STG.E.64 desc[UR14][R2.64+0x20], R8", "R2.64:49 desc14:64 store"},
+		{"LDS R13, [R3]", "R3:17 load"},
+		{"LDS R8, [R5+0x1fc]", "R5:17 load"},
+		{"LDS R8, [R5+-0x4]", "R5:17 load"},
+		{"STS [R2+0x200], R11", "R2:17 store"},
+		{"LD.E R0, [R2.64+UR4]", "R2.64:49 UR4:32 load"},
+		{"LD.E R0, [R2+UR4.64]", "R2:32 UR4.64:49 load"},
+		{"ST.E [R0.X4+UR6.64], R3", "R0.X4:32 UR6.64:49 store"},
+		{"LD.E R0, [R1.U32+UR6.64]", "R1.U32:32 UR6.64:49 load"},
+		{"ATOMG.E.ADD.STRONG.ATOM.U32 PT, R6, desc[UR4][R2.64], R7", "R2.64:49 desc4:64 atomic"},
+		{"ATOMS.ADD R6, [R2+0x10], R7", "R2:17 atomic"},
+		{"RED.E.ADD [R2.64], R7", "R2.64:49 atomic"},
+		{"LDS R8, [RZ+0x400]", "-"},             // immediate only: not reachable
+		{"LDS R8, [0x400]", "-"},
+		{"LDC R0, c[0x0][0x28]", "-"},
+		{"MOV R0, R1", "-"},
+	};
+	int fails = 0, n = 0;
+	auto expect = [&](bool ok, const std::string &what, const std::string &got, const std::string &want) {
+		n++;
+		if (!ok) fails++;
+		printf("%s %-58s -> %-26s%s\n", ok ? "ok  " : "FAIL", what.c_str(), got.c_str(), ok ? "" : (" (expected " + want + ")").c_str());
+	};
+	for (auto &c : cases) {
+		std::string opc; std::vector<OpDesc> ops;
+		parse(c.sass, opc, ops);
+		const std::string got = analyze_addr(opcode_index(short_opcode(opc)), mref_of(c.sass)).str();
+		expect(got == c.expect, c.sass, got, c.expect);
+	}
+	// Which registers come back after the instruction: per register, not per operand
+	struct { const char *sass; int kind, reg; bool isDest; } dest[] = {
+		{"LD.E R2, [R2.64]", AP_RA, 2, true},
+		{"LD.E R2, [R2.64]", AP_RA, 3, false},   // only the low half of the pair is overwritten
+		{"LD.E.64 R2, [R2.64]", AP_RA, 3, true},
+		{"LDG.E R6, desc[UR6][R6.64+-0x10]", AP_RA, 6, true},
+		{"LDG.E R20, desc[UR14][R22.64+0x10]", AP_RA, 22, false},
+		{"LDS R8, [R8+0x4]", AP_RA, 8, true},
+		{"STS [R2], R9", AP_RA, 2, false},
+		{"ATOMG.E.ADD.STRONG.ATOM.U32 PT, R2, desc[UR4][R2.64], R7", AP_RA, 2, true},
+		{"LDG.E R20, desc[UR14][R22.64+0x10]", AP_DESC, 14, false},
+		{"LD.E R0, [R2.64+UR0]", AP_UR, 0, false}, // R0 and UR0 are different registers
+	};
+	for (auto &c : dest) {
+		const bool got = addr_reg_is_dest(c.kind, c.reg, dests_of(c.sass));
+		expect(got == c.isDest, std::string(c.sass) + " " + addrPartNames[c.kind] + " " + std::to_string(c.reg), got ? "written" : "restored", c.isDest ? "written" : "restored");
+	}
+	// Models and sizes in one integer
+	expect(BFM_MODEL(0) == FLIP_SINGLE_BIT && BFM_K(0) == 1, "BFM code 0", "", "");
+	expect(BFM_MODEL(1) == FLIP_TWO_BITS && BFM_K(1) == 1, "BFM code 1", "", "");
+	expect(BFM_MODEL(43) == MCU_ADJ_BITS && BFM_K(43) == 3, "BFM code 43", "", "");
+	expect(BFM_MODEL(54) == MCU_ADJ_REGS && BFM_K(54) == 4, "BFM code 54", "", "");
+	expect(BFM_MODEL(62) == MCU_ADJ_LANES && BFM_K(62) == 2, "BFM code 62", "", "");
+	expect(std::string(instGrouptNames[G_ADDR]) == "addr" && G_GPPR == 11 && G_GP == 12, "group ids are stable", "", "");
+	printf("\n%d/%d address cases passed\n", n - fails, n);
+	return fails;
+}
+
 static int check() {
 	struct { const char *sass, *expect; } cases[] = {
 		{"FFMA R7, R0, R5, 1", "R7x1"},
@@ -137,6 +225,7 @@ static int check() {
 		printf("%s %-55s -> %-16s%s\n", ok ? "ok  " : "FAIL", c.sass, got.c_str(), ok ? "" : (std::string(" (expected ") + c.expect + ")").c_str());
 	}
 	printf("\n%d/%zu cases passed\n", (int)(sizeof(cases) / sizeof(cases[0])) - fails, sizeof(cases) / sizeof(cases[0]));
+	fails += check_addr();
 	return fails ? 1 : 0;
 }
 

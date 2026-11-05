@@ -26,7 +26,7 @@
 
 
 
-import sys, re, string, os, operator, math, datetime, random
+import sys, re, string, os, operator, math, datetime, random, hashlib, json, subprocess, time
 import params as p
 
 # Parse the profile written by profiler.so (one line per dynamic kernel):
@@ -101,6 +101,39 @@ def get_injection_site_info(countList, inj_num, igid):
 			return [item[0], item[1], inj_num-start] # return [kname, kcount, inj_num in this kernel]
 		start += n
 	return ["", -1, -1]
+
+# Seconds the machine has been suspended since boot. A run with a difference has a
+# wall-clock runtime that means nothing, and a GPU context that went through a suspend.
+def suspended_seconds():
+	return time.clock_gettime(time.CLOCK_BOOTTIME) - time.clock_gettime(time.CLOCK_MONOTONIC)
+
+def sha256_of(path):
+	if not os.path.isfile(path):
+		return None
+	h = hashlib.sha256()
+	with open(path, "rb") as f:
+		for block in iter(lambda: f.read(1 << 20), b""):
+			h.update(block)
+	return h.hexdigest()
+
+# Appends what this launch used to a config file: results stay traceable to the
+# binaries. A workload can be rebuilt with no change in git, the golden files and
+# the tools are not in git at all. One line per launch: a change shows as two values.
+def save_hashes(out_path, app, tool):
+	app_dir = p.apps[app][0]
+	flags = os.path.join(os.path.dirname(tool), ".build_flags")
+	entry = {"time": datetime.datetime.now().isoformat(timespec="seconds"), "app": app,
+		"tool": {"path": tool, "sha256": sha256_of(tool)},
+		"tool_build_flags": open(flags).read().strip() if os.path.isfile(flags) else None,
+		"workload": {"path": p.apps[app][2] + p.apps[app][1], "sha256": sha256_of(p.apps[app][2] + p.apps[app][1])},
+		"golden": {f: sha256_of(os.path.join(app_dir, f)) for f in sorted(os.listdir(app_dir)) if f.startswith("golden")}}
+	try:
+		entry["git_head"] = subprocess.run(["git", "-C", p.NVBITFI_HOME, "rev-parse", "HEAD"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, universal_newlines=True).stdout.strip()
+	except OSError:
+		entry["git_head"] = None
+	os.makedirs(os.path.dirname(out_path), exist_ok=True)
+	with open(out_path, "a") as f:
+		f.write(json.dumps(entry) + "\n")
 
 def set_env(app, is_profiler):
 	# Make sure that you use the same ENV variables in the run scripts

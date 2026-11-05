@@ -62,6 +62,24 @@ def kernel_timing(run_outputs):
 	return {k: {"launches": len(v), "mean_us": sum(v) / len(v), "min_us": min(v), "max_us": max(v)} for k, v in us.items()}
 
 
+# Mean timeline over several timing runs: the event times, relative to the first
+# event of each run. One run alone has gaps with a large spread.
+def mean_timeline(runs):
+	if not runs:
+		raise ValueError("no timing runs")
+	kinds = [e["kind"] for e in runs[0]]
+	for r in runs[1:]:
+		if [e["kind"] for e in r] != kinds:
+			raise ValueError("timing runs have different events")
+	out = []
+	for i, e in enumerate(runs[0]):
+		m = dict(e)
+		m["t0"] = sum(r[i]["t0"] - r[0]["t0"] for r in runs) / len(runs)
+		m["t1"] = sum(r[i]["t1"] - r[0]["t0"] for r in runs) / len(runs)
+		out.append(m)
+	return out
+
+
 # Durations without the host time of an empty kernel, for a lower bound
 def subtract_floor(timing, floor_us):
 	return {k: dict(v, mean_us=max(v["mean_us"] - floor_us, 0.0)) for k, v in timing.items()}
@@ -315,15 +333,82 @@ def sample_after_store(events, n, seed):
 	return targets
 
 
+# Multi-cell upsets. The physical layout of the cells is not known, so model, size
+# and distance are parameters, with no default in the code:
+#   adj_bits:  k adjacent bits of one word
+#   adj_words: the same bit in k words, step bytes apart, in one direction chosen
+#              at random: step 4 or 8 for neighbours, a row distance otherwise
+# A word that falls outside the buffer, or outside the window of a CTA, is not
+# flipped. The record keeps the words asked for and the words flipped.
+MCU_ADJ_BITS = "adj_bits"
+MCU_ADJ_WORDS = "adj_words"
+MAX_CELLS = 8 # MEM_MAX_CELLS in mem_injector/mem_injector.h
+
+
+# Range of word offsets allowed for a target: [low, high)
+def target_range(t, events):
+	if t["mode"] == MODE_UNIFORM:
+		shm = next(e["shm"] for e in events if e["kind"] == "kernel" and e["k"] == t["kernel"])
+		return SHM_RESERVED, SHM_RESERVED + shm
+	return 0, t["size"]
+
+
+def apply_mcu(targets, events, model, k, step, seed):
+	rng = random.Random(seed + 1000003)
+	out = []
+	for t in targets:
+		t = dict(t)
+		t["mcu_model"] = model
+		t["cells_requested"] = 1
+		if model == MCU_ADJ_BITS:
+			if not 2 <= k <= 32:
+				raise ValueError("adj_bits needs 2 <= k <= 32")
+			t["mcu_k"] = k
+			# mode s picks its bit at run time: there the tool keeps the window in the word
+			if t["mode"] != MODE_AFTER_STORE:
+				t["bit"] = rng.randrange(33 - k)
+			t["cell_deltas"] = [0]
+		elif model == MCU_ADJ_WORDS:
+			if not 2 <= k <= MAX_CELLS:
+				raise ValueError("adj_words needs 2 <= k <= %d" % MAX_CELLS)
+			if step <= 0 or step % 4:
+				raise ValueError("the step must be a positive multiple of 4 bytes")
+			sign = rng.choice((1, -1))
+			deltas = [sign * j * step for j in range(k)]
+			t.update({"mcu_k": 1, "mcu_step": step, "cells_requested": k})
+			if t["mode"] == MODE_AFTER_STORE:
+				t["cell_deltas"] = deltas # known word only at run time: the tool clips it
+			else:
+				base = t["shm_offset"] if t["mode"] == MODE_UNIFORM else t["offset"]
+				low, high = target_range(t, events)
+				t["cell_deltas"] = [d for d in deltas if low <= base + d and base + d + 4 <= high]
+		else:
+			raise ValueError("unknown MCU model " + model)
+		out.append(t)
+	return out
+
+
 # Contents of nvbitfi-injection-info.txt
 def target_to_info(t):
-	return "".join("%s %s\n" % (k, t[k]) for k in
-		("mode", "buffer", "size", "offset", "bit", "event", "kernel", "kernel_name", "inst", "sm", "shm_offset", "pick") if k in t)
+	s = "".join("%s %s\n" % (k, t[k]) for k in
+		("mode", "buffer", "size", "offset", "bit", "event", "kernel", "kernel_name", "inst", "sm", "shm_offset", "pick", "mcu_k") if k in t)
+	return s + "".join("cell_delta %d\n" % d for d in t.get("cell_deltas", []))
 
 
 # Why a Masked run was masked, from the trace in the injection record. Only
 # "read_masked" says that the workload tolerates the corruption.
 def masked_subclass(rec):
+	if rec.get("cells"):
+		# One word read as flipped is enough to say that the workload tolerated it
+		sub = [masked_subclass_cell(c) for c in rec["cells"] if c.get("applied", 1)]
+		for s in ("read_masked", "ambiguous", "stale_only", "overwritten"):
+			if s in sub:
+				return s
+		return "no_read"
+	return masked_subclass_cell(rec)
+
+
+def masked_subclass_cell(rec):
 	new_seen = rec["reads_new"] + rec["host_reads"]
 	if rec["first_access"] == ACCESS_WRITE:
 		return "overwritten"
@@ -334,6 +419,53 @@ def masked_subclass(rec):
 	if rec["reads_old"] > 0:
 		return "stale_only"
 	return "no_read"
+
+
+# Outcome classes of a run, for the rates below
+def outcome_class(cat):
+	if cat in OUTCOME_SDC:
+		return "sdc"
+	if cat in (1, 2, 3):
+		return "masked"
+	if cat in (OUTCOME_CRASH, 4, 5):
+		return "due"
+	return "other"
+
+
+# Rates of mode b under the two bounds of the time weights. The targets are sampled
+# with the weights of the upper bound; here each kernel gets the share of the
+# bound. Per kernel, the runs only give the rate inside that kernel: a kernel with
+# no runs has no rate, so its share is reported as unsampled, not guessed.
+# effective_runs: how many unweighted runs have the same variance.
+def mode_b_rates(results, events, timing, floor_us):
+	per_kernel = {}
+	for r in results:
+		if not r.get("injected"):
+			continue
+		name = kernel_short_name(r["kernel_name"])
+		c = per_kernel.setdefault(name, {"runs": 0, "sdc": 0, "masked": 0, "due": 0, "other": 0})
+		c["runs"] += 1
+		c[outcome_class(r["outcome"])] += 1
+	total = sum(c["runs"] for c in per_kernel.values())
+	out = {"floor_us": floor_us, "runs": total, "not_injected": len(results) - total, "per_kernel": per_kernel}
+	for bound, floor in (("upper_as_measured", 0.0), ("lower_without_floor", floor_us)):
+		shares = mode_b_shares(apply_kernel_timing(events, subtract_floor(timing, floor)))
+		rates = {}
+		for cls in ("sdc", "masked", "due", "other"):
+			rate = var = 0.0
+			for name, share in shares.items():
+				c = per_kernel.get(name)
+				if c:
+					p = c[cls] / c["runs"]
+					rate += share * p
+					var += share * share * p * (1 - p) / c["runs"]
+			rates[cls] = {"rate": rate, "std_error": var ** 0.5}
+		w = {n: shares[n] / (per_kernel[n]["runs"] / total) for n in shares if n in per_kernel}
+		sw = sum(w[n] * per_kernel[n]["runs"] for n in w)
+		sw2 = sum(w[n] * w[n] * per_kernel[n]["runs"] for n in w)
+		out[bound] = {"kernel_shares": shares, "rates": rates, "effective_runs": sw * sw / sw2 if sw2 else 0.0,
+			"unsampled_share": sum(s for n, s in shares.items() if n not in per_kernel)}
+	return out
 
 
 # Kernels whose bit is set in the readKernels mask

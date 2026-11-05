@@ -185,6 +185,7 @@ def main():
 				if sys.argv[2] == "clean":
 					clear_results_file(app) # clean log files only if asked for
 	
+			cf.save_hashes(p.app_log_dir[app] + "/config/hashes.jsonl", app, p.INJECTOR_LIB)
 			run_multiple_injections(app, "inst_value", where_to_run)
 	
 	else:

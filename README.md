@@ -58,8 +58,63 @@ Each opcode belongs to one exclusive group, given by the unit that produces its 
 | 10 | unknown | opcodes missing from `arch.h` | none |
 | 11 | gppr | any non-uniform instruction writing a GPR or PR | GPRs + predicate registers |
 | 12 | gp | any non-uniform instruction writing a GPR | GPRs (original NVBitFI default) |
+| 13 | addr | LD, LDG, LDS, ST, STG, STS, ATOM, ATOMG, ATOMS, RED with a register in the address | not a destination: see "Address at the moment of use" |
 
 Profile counts per group are the **injectable** dynamic instances, i.e. those with at least one destination of the right class and the guard predicate true. Uniform-datapath instructions execute once per warp and are counted once per warp. For 1-bit destinations (predicates), `FLIP_SINGLE_BIT` and `FLIP_TWO_BITS` invert the predicate, `RANDOM_VALUE` writes a random 0/1 and `ZERO_VALUE` writes 0.
+
+## Multi-cell upsets in registers
+
+One particle can flip several neighbouring cells. The physical layout of the register files is not known, so these models say nothing about which cells are really neighbours: model and size are parameters, and every record keeps all the cells hit.
+
+| id | model | what it flips | size k |
+|---|---|---|---|
+| 4 | `MCU_ADJ_BITS` | k adjacent bits of one register. `FLIP_TWO_BITS` is k = 2 | 2..8 |
+| 5 | `MCU_ADJ_REGS` | same bit of Rn, Rn+1, ... of one thread (uniform registers: URn, URn+1, ...) | 2..8 |
+| 6 | `MCU_ADJ_LANES` | same bit of the same register in k adjacent lanes of the warp | 2..8 |
+
+Model and size go in one integer, in `inst_value_igid_bfm_map` and in the file names: `mcu_bfm(MCU_ADJ_BITS, 3)` = 43.
+
+- **Predicate registers** (flags of one thread, P0-P6) and **uniform predicates** (flags of one warp, UP0-UP6): models 4 and 5 flip k adjacent bits around the destination, also non-destination flags. Model 6 flips the same predicate in k lanes.
+- **Window.** `MCU_ADJ_LANES` draws a window of k lanes holding the selected one. `MCU_ADJ_BITS` draws its window inside the 32 bits.
+- **What cannot be reached.** A lane that is not active does not run tool code, so it cannot be written. `MCU_ADJ_REGS` stops at the highest register named by the code of the function: a neighbour above it is not written, so it cannot make a run SDC, and a physically adjacent unused register would be Masked anyway. Reading above it can fail: on `gemm_core` `num_registers` says 40, the code uses up to R37, and DUMMY=1 runs that read R38 ended in `illegal instruction` (cause not established). `requested_cells` is what the model asked for, `cells` what was written, so the shortfall can be counted.
+- **Uniform registers have no lanes:** model 6 on group `uniform` is refused at startup.
+- `cells` in the JSONL has `reg_no`, `lane`, `tid`, `mask`, `before`, `after` per register. A predicate model with k bits is one cell with k bits in `mask`. The top-level fields stay those of the selected cell.
+
+Default distribution of the sizes, for weighting afterwards and not for sampling: `scripts/mcu_sizes.py`, with its sources and how far they apply to this GPU.
+
+## Address at the moment of use
+
+A transient fault in the path of an address, not in the register: the instruction uses a wrong address, then the register is correct again. Group `addr` (13), model `FLIP_SINGLE_BIT`.
+
+- **BEFORE** the instruction, one bit of a register of the address is flipped. **AFTER**, the register gets its value back, unless the instruction wrote that register itself (`LDG.64 R2, [R2.64]`). The check is per register: `LDG R2, [R2.64]` overwrites R2 but R3 comes back.
+- **Which bit:** uniform over the significant bits of all the register parts:
+
+  | Part | Registers | Significant bits |
+  |---|---|---|
+  | `ra`, global | Rn:Rn+1 | 49, virtual address: assumed, not measured |
+  | `ra`, 32-bit | Rn | 32 |
+  | `ra`, shared | Rn | 17: 102400 bytes per SM |
+  | `ur`, in `[R+UR]` | URn, or URn:URn+1 | 32, or 49 |
+  | `desc`, in `desc[UR]` | URn:URn+1 | 64: undocumented, see `tests/desc_probe/README.md` |
+
+- **Immediate offsets are not reachable.** `[R5+0x1fc]`: 0x1fc is in the instruction word, not in a register.
+- **Uniform parts hit the whole warp:** `ur` and `desc` are read by all the active lanes for that instruction. `ra` is one thread.
+- **`desc` takes most of the flips where it exists** (64 bits against 49), and on its own it does not change the address. Compare the rates per `addr_part`.
+- **Record:** `addr_orig`, `addr_new`, `addr_part`, `addr_bit`, `mem_access`, `addr_space`, `addr_valid`, `addr_class`, `store_wrong_location`, `addr_restored`, `addr_overwritten`, and in global memory buffer and offset of both addresses.
+- **`addr_valid` means "inside a live allocation of the application"**, or inside the window of the CTA in shared memory. Memory of the tool or of the CUDA runtime is not tracked, so a load can be "invalid" and still not crash.
+- **`addr_class`:** `load_valid`, `load_invalid`, `store_invalid`, `atomic_invalid`, `desc_*`, and apart `store_wrong_location` and `atomic_wrong_location`: a write in valid memory, which corrupts another location with no error, and leaves the right one stale.
+- **Not generalised to all source operands.** The device code works on (register class, register, bit), so another source needs only a way to list its candidates, but only addresses are implemented.
+- With DUMMY=1 `addr_new` is computed and not used.
+
+`scripts/check_fault_locations.py` compares the wrong elements of each run with the record.
+
+Pilot, single seed, not final (20-100 runs per configuration, on gemm, ptr_chase and shm_stencil). DUMMY=1: 240/240
+Masked, counts equal to the profile, before == after in all cells. DUMMY=0, address model, SDC/crash/Masked: gemm
+13/23/64, ptr_chase 15/27/58, of which the descriptor 0/2/64 and 0/0/58, so read the address register and the
+descriptor apart. Location check: 475/486 register SDCs inside the expected elements. All 11 exceptions are
+`MCU_ADJ_REGS`, where a neighbouring register can hold an index or a pointer, which displaces a store; one of them
+(ptr_chase, `k_walk`, FFMA R0-R2, 24 wrong elements across the warp) is not explained yet. `MCU_ADJ_REGS` can write
+fewer cells than asked (574 of 590) because the range stops at the highest register the function names.
 
 ## Injection log and results
 

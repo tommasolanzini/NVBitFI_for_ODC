@@ -215,9 +215,9 @@ def print_stats_tsv(typ):
 			for bfm in bfm_list: 
 				if igid in num_injections_app_table[app]:
 					if bfm in num_injections_app_table[app][igid]:
-						f.write("\t".join([p.EM_STR[bfm], str(num_injections_app_table[app][igid][bfm]), str(runtime_app_table[app][igid][bfm]),  str(runtime_app_nt_table[app][igid][bfm])]) + "\n")
+						f.write("\t".join([p.em_str(bfm), str(num_injections_app_table[app][igid][bfm]), str(runtime_app_table[app][igid][bfm]),  str(runtime_app_nt_table[app][igid][bfm])]) + "\n")
 					else:
-						f.write("\t".join([p.EM_STR[bfm], "0", "0"] + "\n"))
+						f.write("\t".join([p.em_str(bfm), "0", "0"] + "\n"))
 	f.close()
 
 
@@ -240,10 +240,10 @@ def print_detailed_results_tsv(typ):
 				written = False
 				if igid in results_app_table[app]:
 					if bfm in results_app_table[app][igid]:
-						f.write("\t".join([p.EM_STR[bfm]] + list(map(str,to_list(results_app_table[app][igid][bfm], p.NUM_CATS)))) + "\n")
+						f.write("\t".join([p.em_str(bfm)] + list(map(str,to_list(results_app_table[app][igid][bfm], p.NUM_CATS)))) + "\n")
 						written = True
 				if not written:
-					f.write("\t".join([p.EM_STR[bfm]] + list(map(str,to_list({}, p.NUM_CATS)))))
+					f.write("\t".join([p.em_str(bfm)] + list(map(str,to_list({}, p.NUM_CATS)))))
 	f.close()
 
 ###############################################################################

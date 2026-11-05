@@ -166,5 +166,106 @@ for fn, name in ((mp.sample_uniform, "u"), (mp.sample_after_store, "s")):
 	except ValueError:
 		check("no shared memory raises " + name, True, True)
 
+# Correction 4: mean timeline
+r1 = [{"e": 0, "kind": "alloc", "t0": 100, "t1": 110}, {"e": 1, "kind": "kernel", "t0": 200, "t1": 300, "k": 0, "name": "k"}]
+r2 = [{"e": 0, "kind": "alloc", "t0": 1000, "t1": 1030}, {"e": 1, "kind": "kernel", "t0": 1300, "t1": 1500, "k": 0, "name": "k"}]
+mt = mp.mean_timeline([r1, r2])
+check("mean: first event at 0", mt[0]["t0"], 0)
+check("mean t1 first event", mt[0]["t1"], 20)
+check("mean of the gap", mt[1]["t0"], 200)
+check("mean of the duration", mt[1]["t1"] - mt[1]["t0"], 150)
+check("mean keeps the fields", mt[1]["name"], "k")
+try:
+	mp.mean_timeline([r1, r2[:1]])
+	check("different events raise", False, True)
+except ValueError:
+	check("different events raise", True, True)
+check("one run keeps its gaps", mp.mean_timeline([r1])[1]["t0"], 100)
+
+# Correction 2: rates per kernel under the two bounds. Buffer of 100 bytes, live in both
+EVB = [{"e": 0, "kind": "alloc", "t0": 0, "t1": 1, "id": 0, "size": 100},
+	{"e": 1, "kind": "kernel", "t0": 10, "t1": 20, "k": 0, "name": "ka(int)", "instrs": 10},
+	{"e": 2, "kind": "kernel", "t0": 30, "t1": 40, "k": 1, "name": "kb(int)", "instrs": 10}]
+TIM = {"ka": {"mean_us": 3.0}, "kb": {"mean_us": 9.0}}
+RES = [{"injected": True, "kernel_name": "ka(int)", "outcome": 17}] * 2 + [{"injected": True, "kernel_name": "ka(int)", "outcome": 3}] * 2 + \
+	[{"injected": True, "kernel_name": "kb(int)", "outcome": 3}] * 6 + [{"injected": False, "kernel_name": "kb(int)", "outcome": 19}]
+rb = mp.mode_b_rates(RES, EVB, TIM, 2.0)
+check("rates: runs", (rb["runs"], rb["not_injected"]), (10, 1))
+check("rates: upper shares", rb["upper_as_measured"]["kernel_shares"], {"ka": 0.25, "kb": 0.75})
+check("rates: upper sdc", rb["upper_as_measured"]["rates"]["sdc"]["rate"], 0.25 * 0.5)
+lo = rb["lower_without_floor"]
+check("rates: lower shares", lo["kernel_shares"], {"ka": 1 / 8, "kb": 7 / 8})
+check("rates: lower sdc", lo["rates"]["sdc"]["rate"], 1 / 8 * 0.5)
+check("rates: masked plus sdc", lo["rates"]["sdc"]["rate"] + lo["rates"]["masked"]["rate"], 1.0)
+check("rates: nothing unsampled", lo["unsampled_share"], 0)
+check("rates: proportional sampling loses nothing", abs(mp.mode_b_rates(RES[:1] + RES[4:5], EVB, {"ka": {"mean_us": 1.0}, "kb": {"mean_us": 1.0}}, 0.0)["upper_as_measured"]["effective_runs"] - 2) < 1e-9, True)
+rb2 = mp.mode_b_rates(RES[:4], EVB, TIM, 2.0)
+check("rates: kernel with no runs", rb2["upper_as_measured"]["unsampled_share"], 0.75)
+check("rates: no guess on it", rb2["upper_as_measured"]["rates"]["sdc"]["rate"], 0.25 * 0.5)
+
+# Multi-cell upsets
+GT = [{"mode": "a", "buffer": 0, "size": 100, "offset": 0, "bit": 31, "event": 1}, {"mode": "a", "buffer": 0, "size": 100, "offset": 96, "bit": 0, "event": 1}]
+ab = mp.apply_mcu(GT, EVB, mp.MCU_ADJ_BITS, 3, None, 1)
+check("adj_bits window in the word", all(0 <= t["bit"] <= 29 for t in mp.apply_mcu(GT * 200, EVB, mp.MCU_ADJ_BITS, 3, None, 1)), True)
+check("adj_bits reaches both ends", {min(t["bit"] for t in mp.apply_mcu(GT * 200, EVB, mp.MCU_ADJ_BITS, 3, None, 1)), max(t["bit"] for t in mp.apply_mcu(GT * 200, EVB, mp.MCU_ADJ_BITS, 3, None, 1))}, {0, 29})
+check("adj_bits one word", (ab[0]["mcu_k"], ab[0]["cell_deltas"], ab[0]["cells_requested"]), (3, [0], 1))
+aw = mp.apply_mcu(GT * 50, EVB, mp.MCU_ADJ_WORDS, 3, 4, 1)
+check("adj_words first word stays", all(t["cell_deltas"][0] == 0 for t in aw), True)
+check("adj_words keeps the bit", (aw[0]["bit"], aw[0]["mcu_k"], aw[0]["mcu_step"]), (31, 1, 4))
+check("adj_words inside the buffer", all(0 <= t["offset"] + d and t["offset"] + d + 4 <= 100 for t in aw for d in t["cell_deltas"]), True)
+check("adj_words asks for k", {t["cells_requested"] for t in aw}, {3})
+check("adj_words clips at the start", {len(t["cell_deltas"]) for t in aw if t["offset"] == 0}, {1, 3})
+check("adj_words clips at the end", {len(t["cell_deltas"]) for t in aw if t["offset"] == 96}, {1, 3})
+check("adj_words row step", {abs(d) for t in mp.apply_mcu(GT * 5, EVB, mp.MCU_ADJ_WORDS, 2, 64, 1) for d in t["cell_deltas"]} <= {0, 64}, True)
+for bad in ((mp.MCU_ADJ_WORDS, 2, 3), (mp.MCU_ADJ_WORDS, 9, 4), (mp.MCU_ADJ_BITS, 33, None), ("none", 2, 4)):
+	try:
+		mp.apply_mcu(GT, EVB, bad[0], bad[1], bad[2], 1)
+		check("bad MCU parameters raise %r" % (bad,), False, True)
+	except ValueError:
+		check("bad MCU parameters raise %r" % (bad,), True, True)
+SHK = [{"e": 1, "kind": "kernel", "t0": 0, "t1": 1, "k": 0, "name": "s", "instrs": 10, "shm": 16, "ctas": []}]
+us = mp.apply_mcu([{"mode": "u", "kernel": 0, "shm_offset": 1024 + 12, "bit": 1}] * 40, SHK, mp.MCU_ADJ_WORDS, 2, 4, 1)
+check("shared u stays in the window", all(1024 <= 1036 + d and 1036 + d + 4 <= 1040 for t in us for d in t["cell_deltas"]), True)
+ss = mp.apply_mcu([{"mode": "s", "kernel": 0, "bit": 77}] * 40, SHK, mp.MCU_ADJ_WORDS, 2, 8, 1)
+check("shared s keeps all: the tool clips", {len(t["cell_deltas"]) for t in ss}, {2})
+check("shared s bit stays a seed", mp.apply_mcu([{"mode": "s", "kernel": 0, "bit": 7777}], SHK, mp.MCU_ADJ_BITS, 2, None, 1)[0]["bit"], 7777)
+info2 = mp.target_to_info(dict(GT[0], mcu_k=3, cell_deltas=[0, -4]))
+check("info has the size", "mcu_k 3\n" in info2, True)
+check("info has the words", "cell_delta 0\ncell_delta -4\n" in info2, True)
+check("info stays the same without MCU", "cell_delta" in mp.target_to_info(GT[0]), False)
+cell = lambda **k: dict({"applied": 1, "reads_old": 0, "reads_new": 0, "host_reads": 0, "first_access": 0}, **k)
+sc = lambda *cs: mp.masked_subclass({"cells": list(cs)})
+check("cells: nothing", sc(cell(), cell()), "no_read")
+check("cells: any read of the flip wins", sc(cell(first_access=2), cell(reads_new=1, first_access=1)), "read_masked")
+check("cells: overwritten over no read", sc(cell(), cell(first_access=2)), "overwritten")
+check("cells: stale over overwritten", sc(cell(first_access=2), cell(reads_old=1, first_access=1)), "stale_only")
+check("cells: ambiguous", sc(cell(first_access=3), cell(reads_old=1, first_access=1)), "ambiguous")
+check("cells: read before a write counts", sc(cell(reads_new=2, first_access=1)), "read_masked")
+check("cells: word not flipped does not count", sc(cell(applied=0, reads_new=5), cell()), "no_read")
+check("old records still work", mp.masked_subclass({"reads_new": 1, "host_reads": 0, "reads_old": 0, "first_access": 1}), "read_masked")
+
+# Default MCU sizes: only for weighting afterwards
+import mcu_sizes as ms
+for name, t in ms.MCU_SIZE_TABLES.items():
+	check("sizes sum to 1 " + name, abs(sum(t.values()) - 1) < 1e-9, True)
+wr = ms.weighted_rate({1: 0.5, 2: 1.0})
+check("weighted rate", abs(wr["rate"] - (0.76 * 0.5 + 0.17)) < 1e-9, True)
+check("share with no rate is not assumed", abs(wr["share_without_rate"] - 0.07) < 1e-9, True)
+
+# Records of the register injector
+os.environ.setdefault("NVBITFI_HOME", os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+import params as pr, run_one_injection as roi
+check("code to model", (pr.bfm_model(43), pr.bfm_k(43), pr.bfm_model(0), pr.bfm_k(0), pr.mcu_bfm(pr.MCU_ADJ_LANES, 4)), (4, 3, 0, 1, 64))
+check("model names", (pr.em_str(53), pr.em_str(0)), ("MCU_ADJ_REGS_K3", "FLIP_SINGLE_BIT"))
+check("cells from the log", roi.get_cells({"numCells": "2", "cell0": "7 2 5890 0x400 0x72fd 0x76fd", "cell1": "8 2 5890 0x400 0x1 0x401"})[1],
+	{"reg_no": 8, "lane": 2, "tid": 5890, "mask": "0x400", "before": "0x1", "after": "0x401"})
+base = {"addrPart": "ra", "memAccess": "store", "addrValid": "1", "addrBit": "4", "addrRestored": "1", "addrOverwritten": "0"}
+check("store in valid memory is apart", (roi.addr_record(base)["addr_class"], roi.addr_record(base)["store_wrong_location"]), ("store_wrong_location", True))
+check("store outside", roi.addr_record(dict(base, addrValid="0"))["addr_class"], "store_invalid")
+check("atomic in valid memory", roi.addr_record(dict(base, memAccess="atomic"))["addr_class"], "atomic_wrong_location")
+check("load in valid memory is not a wrong store", (roi.addr_record(dict(base, memAccess="load"))["addr_class"], roi.addr_record(dict(base, memAccess="load"))["store_wrong_location"]), ("load_valid", False))
+check("descriptor moves no address", (roi.addr_record(dict(base, addrPart="desc", addrValid="na"))["addr_class"], roi.addr_record(dict(base, addrPart="desc", addrValid="na"))["store_wrong_location"]), ("desc_store", False))
+check("not the address model", roi.addr_record({}), {})
+
 print("%d passed, %d failed" % (passed, failed))
 sys.exit(1 if failed else 0)
