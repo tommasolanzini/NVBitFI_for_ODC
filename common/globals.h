@@ -230,6 +230,11 @@ inline MrefDesc nvbit_mref(Instr *i) {
 				m.ur64 = (op->u.mref.ur_mod == InstrType::RegModifierType::U64);
 			}
 			if (op->u.mref.has_desc) m.desc = op->u.mref.desc_ureg_num;
+		} else if (op->type == InstrType::OperandType::CBANK && op->u.cbank.has_reg_offset) {
+			const std::string s = op->str;
+			const size_t b = s.rfind('[');
+			m.cbank_ur = b != std::string::npos && s.compare(b + 1, 2, "UR") == 0;
+			if (op->u.cbank.reg_offset != InstrType::RZ && s.find("RZ") == std::string::npos) m.cbank_reg = op->u.cbank.reg_offset;
 		}
 	}
 	return m;
@@ -254,6 +259,22 @@ inline StaticInstInfo analyze_instr(Instr *i) {
 	si.addr = analyze_addr(si.opcode, nvbit_mref(i));
 	si.flags = eligibility_flags(si.group, si.dests, si.addr);
 	return si;
+}
+
+inline SrcInfo instr_sources(Instr *i, const StaticInstInfo &si) {
+	return analyze_sources(i->getOpcode(), si.opcode, nvbit_operands(i), si.dests, nvbit_mref(i));
+}
+
+// The ABI stack pointer. NVBit's own instrumentation uses it to reach memory, whether
+// or not the application does: see "The stack pointer" in README.md.
+static const int STACK_POINTER_GPR = 1;
+
+inline bool reads_gpr(const std::vector<Instr *> &instrs, int reg) {
+	for (Instr *i : instrs) {
+		const SrcInfo s = instr_sources(i, analyze_instr(i));
+		if (std::find(s.gpr.begin(), s.gpr.end(), reg) != s.gpr.end()) return true;
+	}
+	return false;
 }
 
 // One past the highest GPR and UR named by the instructions of a function, from

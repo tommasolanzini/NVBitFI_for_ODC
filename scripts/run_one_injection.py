@@ -392,6 +392,8 @@ def run_one_injection_job(inj_mode, igid, bfm, app, kname, kcount, iid, opid, bi
 		"exit_code": retcode, "xids": get_xids(dmesg_delta),
 		"cuda_error": get_cuda_error(open(p.inj_run_log).read() if os.path.isfile(p.inj_run_log) else "") or get_cuda_error(open(p.stdout_file).read() if os.path.isfile(p.stdout_file) else ""),
 	}
+	inj_log_record["sp_read_by_app"] = log.get("stackPointerRead", "0") == "1"
+	inj_log_record["sp_not_written"] = not inj_log_record["sp_read_by_app"] and inj_log_record["reg_type"] == "GPR" and any(c["reg_no"] == 1 for c in inj_log_record["cells"])
 	inj_log_record.update(addr_record(log))
 	if timeout_flag:
 		[value_str, pc, inst_type, tid, injBID] = get_inj_info()

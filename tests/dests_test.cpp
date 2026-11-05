@@ -79,6 +79,63 @@ static MrefDesc mref_of(const std::string &line) {
 	return m;
 }
 
+static int check_sources() {
+	static const struct { const char *sass; const char *expect; } cases[] = {
+		{"LDC R1, c[0x0][0x37c]", "-"},
+		{"FFMA R0, R7, R6, R0", "R7 R6 R0"},
+		{"FMUL R6, R3, R6", "R3 R6"},
+		{"ISETP.NE.S64.AND P0, PT, R4, RZ, PT", "R4 R5"},
+		{"ISETP.GE.U32.AND P0, PT, R3, R4, P1", "R3 R4 P1"},
+		{"IMAD.WIDE R2, R9, 0x8, R2", "R9 R2 R3"},
+		{"IMAD R9, R9, 0x40, R0", "R9 R0"},
+		{"LEA R2, P0, R9, UR6, 0x2", "R9 UR6"},
+		{"LEA.HI.X R3, R9, UR7, R4, 0x2, P0", "R9 R4 P0 UR7"},
+		{"SHF.R.S32.HI R4, RZ, 0x1f, R9", "R9"},
+		{"SHF.L.U64.HI R4, R2, 0x2, R3", "R2 R3"},
+		{"IADD.64 R4, R2, R6", "R2 R3 R6 R7"},
+		{"IADD3 R0, P0, R2, R3, R4", "R2 R3 R4"},
+		{"LDG.E.64 R4, desc[UR4][R4.64]", "R4 R5 UR4 UR5"},
+		{"LDG.E R3, desc[UR4][R2.64]", "R2 R3 UR4 UR5"},
+		{"STG.E desc[UR4][R2.64], R0", "R0 R2 R3 UR4 UR5"},
+		{"STG.E.64 desc[UR14][R2.64+0x20], R12", "R12 R13 R2 R3 UR14 UR15"},
+		{"STG.E.128 desc[UR4][R2.64], R8", "R8 R9 R10 R11 R2 R3 UR4 UR5"},
+		{"LDS R3, [R2+0x400]", "R2"},
+		{"STS [R2+0x600], R3", "R3 R2"},
+		{"ATOMG.E.ADD.STRONG.ATOM.U32 PT, R6, desc[UR4][R2.64], R7", "R7 R2 R3 UR4 UR5"},
+		{"HMMA.16816.F32 R12, R16, R30, R12", "R16 R17 R18 R19 R30 R31 R12 R13 R14 R15"},
+		{"MOV R0, UR4", "UR4"},
+		{"S2R R9, SR_CTAID.X", "-"},
+		{"CS2R R10, SRZ", "-"},
+		{"LDCU.64 UR4, c[0x0][0x358]", "-"},
+		{"UISETP.NE.AND UP0, UPT, UR4, URZ, UPT", "UR4"},
+		{"UIADD3.64 UR4, UR2, 0x4, URZ", "UR2 UR3"},
+		{"UIMAD.WIDE.U32 UR4, UR2, UR6, UR8", "UR2 UR6 UR8 UR9"},
+		{"ULEA.HI.X UR5, UR2, UR3, URZ, 0x2, UP0", "UR2 UR3 UP0"},
+		{"SEL R2, R3, R4, P0", "R3 R4 P0"},
+		{"PLOP3.LUT P0, PT, P1, P2, PT, 0x8, 0x80", "P1 P2"},
+		{"R2UR UR4, R2", "R2"},
+		{"BRA 0x100", "-"},
+		{"RET.REL.NODEC R4, 0x0", "R4"},
+		{"F2F.F64.F32 R2, R4", "R4"},
+		{"F2F.F32.F64 R2, R4", "R4 R5"},
+		{"DFMA R2, R4, R6, R8", "R4 R5 R6 R7 R8 R9"},
+		{"LOP3.LUT P0, RZ, R2, R3, RZ, 0x40, PT", "R2 R3"},
+		{"VOTE.ANY R0, PT, P1", "P1"},
+	};
+	int fails = 0;
+	for (const auto &c : cases) {
+		std::string opc; std::vector<OpDesc> ops;
+		parse(c.sass, opc, ops);
+		const int idx = opcode_index(short_opcode(opc));
+		const std::string got = analyze_sources(opc, idx, ops, analyze_dests(opc, idx, ops), mref_of(c.sass)).str();
+		const bool ok = got == c.expect;
+		if (!ok) fails++;
+		printf("%s %-58s -> %s%s\n", ok ? "ok  " : "FAIL", c.sass, got.c_str(), ok ? "" : (std::string(" (expected ") + c.expect + ")").c_str());
+	}
+	printf("\n%d/%zu source cases passed\n", (int)(sizeof(cases) / sizeof(cases[0])) - fails, sizeof(cases) / sizeof(cases[0]));
+	return fails;
+}
+
 static int check_addr() {
 	struct { const char *sass, *expect; } cases[] = {
 		{"LDG.E R20, desc[UR14][R22.64+0x10]", "R22.64:49 desc14:64 load"},
@@ -226,6 +283,7 @@ static int check() {
 	}
 	printf("\n%d/%zu cases passed\n", (int)(sizeof(cases) / sizeof(cases[0])) - fails, sizeof(cases) / sizeof(cases[0]));
 	fails += check_addr();
+	fails += check_sources();
 	return fails ? 1 : 0;
 }
 

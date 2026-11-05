@@ -201,7 +201,7 @@ extern "C" __device__ __noinline__ void inject_select(uint64_t piinfo, uint64_t 
 // AFTER: corrupt one destination of the selected instance
 // ---------------------------------------------------------------------------
 extern "C" __device__ __noinline__ void inject_error(uint64_t piinfo, uint64_t pshadow, uint64_t pverbose_device,
-		int offset, uint32_t gprRange, uint32_t prMask, uint32_t urRange, uint32_t upMask, int maxGpr, int maxUr, int regval) {
+		int offset, uint32_t gprRange, uint32_t prMask, uint32_t urRange, uint32_t upMask, int maxGpr, int maxUr, int skipGpr, int regval) {
 	inj_info_t* inj_info = (inj_info_t*)piinfo;
 	volatile inj_shadow_t *rec = (volatile inj_shadow_t *)pshadow;
 	uint32_t verbose_device = *((uint32_t *)pverbose_device);
@@ -253,17 +253,19 @@ extern "C" __device__ __noinline__ void inject_error(uint64_t piinfo, uint64_t p
 		}
 		unsigned int before = nvbit_read_reg((uint64_t)r);
 		unsigned int mask = get_mask(model, k, seed, before);
-		unsigned int after = DUMMY ? before : (before ^ mask);
+		// skipGpr: the stack pointer of an application that never reads it. The flip stays
+		// in the record and in the denominator, but it cannot change a real run.
+		unsigned int after = (DUMMY || r == skipGpr) ? before : (before ^ mask);
 		if (leader) record_injection(rec, REG_GPR, r, mask, before, after);
 		record_cell(rec, laneCell, r, lane, mask, before, after);
-		if (!DUMMY) nvbit_write_reg((uint64_t)r, after);
+		if (!DUMMY && r != skipGpr) nvbit_write_reg((uint64_t)r, after);
 		if (model == MCU_ADJ_REGS) {
 			rec->requestedCells = k;
 			for (int j = 1; j < k && r + j < maxGpr; j++) {
 				const unsigned int b = nvbit_read_reg((uint64_t)(r + j));
-				const unsigned int a = DUMMY ? b : (b ^ mask);
+				const unsigned int a = (DUMMY || r + j == skipGpr) ? b : (b ^ mask);
 				record_cell(rec, j, r + j, lane, mask, b, a);
-				if (!DUMMY) nvbit_write_reg((uint64_t)(r + j), a);
+				if (!DUMMY && r + j != skipGpr) nvbit_write_reg((uint64_t)(r + j), a);
 				numCells++;
 			}
 		}

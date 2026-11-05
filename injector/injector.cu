@@ -42,6 +42,9 @@
 #include "utils/utils.h"
 
 #include "globals.h"
+
+// Does the application read R1? Otherwise inject_error does not write it
+bool stack_pointer_read = false;
 #include "injector.h"
 
 int verbose;
@@ -150,6 +153,7 @@ void write_inj_record(long long groupInstrs) {
 		fout << "index: " << target_index << std::endl;
 		fout << "kernel_name: " << target_kname << std::endl;
 		fout << "ctas: " << target_ctas << std::endl;
+		fout << "stackPointerRead: " << (stack_pointer_read ? 1 : 0) << std::endl;
 	}
 	// injectable instances of the selected group in this kernel (must match the profile)
 	if (groupInstrs >= 0) fout << "groupInstrs: " << groupInstrs << std::endl;
@@ -339,6 +343,10 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func) {
 	related_functions.push_back(func); /* add kernel itself to the related function vector */
 
 	for (auto f : related_functions) {
+		if (reads_gpr(nvbit_get_instrs(ctx, f), STACK_POINTER_GPR)) stack_pointer_read = true;
+	}
+
+	for (auto f : related_functions) {
 		/* skip functions that were already instrumented */
 		if (!already_instrumented.insert(f).second) {
 			continue;
@@ -419,6 +427,7 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func) {
 			nvbit_add_call_arg_const_val32(i, si.dests.up_mask);
 			nvbit_add_call_arg_const_val32(i, used.gpr); // MCU_ADJ_REGS stops here
 			nvbit_add_call_arg_const_val32(i, used.ur);
+			nvbit_add_call_arg_const_val32(i, stack_pointer_read ? -1 : STACK_POINTER_GPR);
 			if (si.dests.num_gpr > 0) {
 				nvbit_add_call_arg_reg_val(i, si.dests.gpr_base); // first destination GPR value (sanity check)
 			} else {

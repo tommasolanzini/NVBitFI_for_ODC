@@ -10,6 +10,7 @@ dests_test: dests_test.cpp ../common/dests.h ../common/arch.h
 check: dests_test
 	./dests_test --check
 	python3 test_fp_signature.py
+	python3 test_liveness.py
 
 clean:
 	rm -f dests_test

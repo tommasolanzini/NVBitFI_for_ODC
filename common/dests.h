@@ -109,6 +109,7 @@ struct DestInfo {
 	int ur_base = -1;       // first destination UR, -1 if none
 	int num_ur = 0;         // number of consecutive destination URs
 	uint32_t up_mask = 0;   // bit k set: UPk is a destination (k = 0..6)
+	size_t ops_used = 0;    // leading operands that are destinations; the rest are sources
 
 	int num_pr() const { return __builtin_popcount(pr_mask); }
 	int num_up() const { return __builtin_popcount(up_mask); }
@@ -278,20 +279,23 @@ inline DestInfo analyze_dests(const std::string &fullOpcode, int opIdx, const st
 			if (k < ops.size() && pred_then_reg_dest(opIdx)) {
 				if (ops[k].kind == OK_REG) addGPR(ops[k].num);
 				else if (ops[k].kind == OK_UREG) addUR(ops[k].num);
+				k++;
 			}
 			break;
 		}
 		case OK_UPRED: {        // UPd [, UPd] [, URd if pred_then_reg_dest] , sources...
 			int maxp = max_pred_dests(opIdx);
 			for (k = 0; k < ops.size() && maxp > 0 && ops[k].kind == OK_UPRED; k++, maxp--) addUP(ops[k].num);
-			if (k < ops.size() && pred_then_reg_dest(opIdx) && ops[k].kind == OK_UREG) addUR(ops[k].num);
+			if (k < ops.size() && pred_then_reg_dest(opIdx) && ops[k].kind == OK_UREG) { addUR(ops[k].num); k++; }
 			break;
 		}
 		case OK_PR_ALL:         // R2P PR, Rs, mask  -> predicates selected by the mask
 			d.pr_mask = imm_mask_after(ops, 1);
+			k = 1;
 			break;
 		case OK_UPR_ALL:        // UR2UP UPR, URs, mask
 			d.up_mask = imm_mask_after(ops, 1);
+			k = 1;
 			break;
 		default:
 			break;
@@ -307,6 +311,7 @@ inline DestInfo analyze_dests(const std::string &fullOpcode, int opIdx, const st
 		d.ur_base = -1; d.num_ur = 0; d.up_mask = 0;
 	}
 	if (grp == G_PR) { d.gpr_base = -1; d.num_gpr = 0; }
+	d.ops_used = k;
 	return d;
 }
 
@@ -335,6 +340,8 @@ struct MrefDesc {
 	int ur = -1;
 	bool ur64 = false;
 	int desc = -1;          // desc[URn]: always a 64-bit pair
+	int cbank_reg = -1;     // c[0x0][Rn]: register offset of a constant bank
+	bool cbank_ur = false;  // that register is a uniform register
 };
 
 struct AddrPart {
@@ -401,6 +408,93 @@ inline uint32_t pack_part(const AddrPart &p) {
 inline bool addr_reg_is_dest(int kind, int reg, const DestInfo &d) {
 	if (kind == AP_RA) return d.num_gpr > 0 && reg >= d.gpr_base && reg < d.gpr_base + d.num_gpr;
 	return d.num_ur > 0 && reg >= d.ur_base && reg < d.ur_base + d.num_ur;
+}
+
+//////////////////////////////////////////////////////////////////////////////
+// Source registers of an instruction (liveness tool, stack pointer check)
+//////////////////////////////////////////////////////////////////////////////
+struct SrcInfo {
+	std::vector<int> gpr, ur;
+	uint32_t pr_mask = 0, up_mask = 0;
+	std::string str() const {
+		std::stringstream ss;
+		for (int r : gpr) ss << "R" << r << " ";
+		for (int k = 0; k < 7; k++) if (pr_mask >> k & 1) ss << "P" << k << " ";
+		for (int r : ur) ss << "UR" << r << " ";
+		for (int k = 0; k < 7; k++) if (up_mask >> k & 1) ss << "UP" << k << " ";
+		std::string s = ss.str();
+		return s.empty() ? "-" : s.substr(0, s.size() - 1);
+	}
+};
+
+// Registers read through one operand. pos = position among the source operands,
+// immediates and constant banks included. When a rule is unsure it reads more: a
+// missed read would make a live register look dead, which is the worse error.
+inline int src_width(const std::string &fullOpcode, int opIdx, int pos) {
+	const std::vector<std::string> t = split_opcode(fullOpcode);
+	const auto is64 = [&]() { return has_token(t, "64") || has_token(t, "U64") || has_token(t, "S64") || has_token(t, "F64"); };
+	if (opcode_group(opIdx) == G_TC) {
+		// HMMA.16816: A is 16 x 16 fp16, B is 16 x 8 fp16, C is the accumulator, per thread
+		if (opIdx == HMMA && has_token(t, "16816")) return pos == 0 ? 4 : pos == 1 ? 2 : mma_dest_regs(t, opIdx);
+		return std::max(4, mma_dest_regs(t, opIdx)); // other shapes: not checked, read more
+	}
+	switch (opIdx) {
+		case DADD: case DFMA: case DMUL: case DMNMX: case DSETP:
+			return 2;
+		case SHF: case USHF: // each half of the funnel is its own operand
+			return 1;
+		case IMAD: case UIMAD: // WIDE: a 64-bit addend
+			return (has_token(t, "WIDE") && pos == 2) ? 2 : 1;
+		case F2F: case FRND: case UF2F: case UFRND: { // destination type, then source type
+			int seen = 0;
+			for (size_t k = 1; k < t.size(); k++) {
+				if (t[k] == "F64" || t[k] == "F32" || t[k] == "F16" || t[k] == "BF16") {
+					if (seen++ == 1) return t[k] == "F64" ? 2 : 1;
+				}
+			}
+			return is64() ? 2 : 1;
+		}
+		case I2F: case UI2F:
+			return (has_token(t, "U64") || has_token(t, "S64")) ? 2 : 1;
+		case F2I: case UF2I:
+			return has_token(t, "F64") ? 2 : 1;
+		case ST: case STG: case STS:
+			if (has_token(t, "256")) return 8;
+			if (has_token(t, "128")) return 4;
+			return is64() ? 2 : 1;
+		default:
+			return is64() ? 2 : 1;
+	}
+}
+
+// d comes from analyze_dests, on the same operands. The guard predicate is not an
+// operand: the caller adds it.
+inline SrcInfo analyze_sources(const std::string &fullOpcode, int opIdx, const std::vector<OpDesc> &ops, const DestInfo &d, const MrefDesc &m) {
+	SrcInfo s;
+	const auto add = [](std::vector<int> &v, int r) { if (std::find(v.begin(), v.end(), r) == v.end()) v.push_back(r); };
+	int pos = 0;
+	for (size_t k = d.ops_used; k < ops.size(); k++, pos++) {
+		const OpDesc &op = ops[k];
+		const int w = src_width(fullOpcode, opIdx, pos);
+		if (op.kind == OK_REG && op.num >= 0 && op.num < RZ_NUM) {
+			for (int j = 0; j < w && op.num + j < RZ_NUM; j++) add(s.gpr, (int)op.num + j);
+		} else if (op.kind == OK_UREG && op.num >= 0 && op.num < MAX_UR) {
+			for (int j = 0; j < w && op.num + j < MAX_UR; j++) add(s.ur, (int)op.num + j);
+		} else if (op.kind == OK_PRED && op.num >= 0 && op.num < PT_NUM) {
+			s.pr_mask |= 1u << op.num;
+		} else if (op.kind == OK_UPRED && op.num >= 0 && op.num < PT_NUM) {
+			s.up_mask |= 1u << op.num;
+		} else if (op.kind == OK_PR_ALL) {
+			s.pr_mask |= imm_mask_after(ops, k + 1);
+		} else if (op.kind == OK_UPR_ALL) {
+			s.up_mask |= imm_mask_after(ops, k + 1);
+		}
+	}
+	if (m.ra >= 0 && m.ra < RZ_NUM) { add(s.gpr, m.ra); if (m.ra64) add(s.gpr, m.ra + 1); }
+	if (m.ur >= 0) { add(s.ur, m.ur); if (m.ur64) add(s.ur, m.ur + 1); }
+	if (m.desc >= 0) { add(s.ur, m.desc); add(s.ur, m.desc + 1); }
+	if (m.cbank_reg >= 0) add(m.cbank_ur ? s.ur : s.gpr, m.cbank_reg);
+	return s;
 }
 
 #endif

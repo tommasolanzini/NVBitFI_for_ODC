@@ -116,6 +116,53 @@ descriptor apart. Location check: 475/486 register SDCs inside the expected elem
 (ptr_chase, `k_walk`, FFMA R0-R2, 24 wrong elements across the warp) is not explained yet. `MCU_ADJ_REGS` can write
 fewer cells than asked (574 of 590) because the range stops at the highest register the function names.
 
+## The stack pointer (R1)
+
+The kernels of all the workloads start with `LDC R1, c[0x0][0x37c]` and then never read R1: it is the ABI stack pointer, and they use no stack. NVBit's
+instrumentation uses it anyway. So a flip in R1 can change a run through the tool, where the same flip in the real kernel would do nothing.
+
+Measured on `k_walk` of ptr_chase, R1 flips alone, before the fix (`logs/run39-2026-11-05/`):
+
+| Bit flipped | Result |
+|---|---|
+| 0-2 | crash, `misaligned address` |
+| 3-8, 10 | Masked |
+| 9, lane 0 | 21-22 threads of the warp never store their result; no other lane gave this, in 40 runs |
+| 11-31 | crash, `illegal memory access`, Xid 13 |
+
+So the injector does not write R1 when no instruction of the kernel, or of what it calls, reads it (`reads_gpr`). The flip stays in the record, with
+before == after and `sp_not_written`, and in the denominator, as it is a real instance that a real flip would leave masked. After the fix 40/40 flips were Masked.
+
+If a kernel does read R1, the injector writes it and sets `sp_read_by_app`. Then an effect may come from the application or from the tool, and those runs must be
+looked at apart. No workload here does. `pf_injector`, not wired into the scripts, does not have this guard. Why lane 0 and bit 9 lose the stores is not established: NVBit is closed.
+
+## Register liveness
+
+`liveness/` measures, for each value written to a GPR, predicate register, uniform register or uniform predicate, the time from the write to the last read
+before the next write. Time runs on the thread (GPR, predicate registers) or on the warp (uniform registers and predicates).
+
+```bash
+make -C liveness ARCH=sm_120
+python3 scripts/run_liveness.py gemm <dir>                                # also checks the golden output
+python3 scripts/liveness_report.py occupancy <dir>/liveness.jsonl         # (a) live share per kernel
+python3 scripts/liveness_report.py reweight <dir>/liveness.jsonl results-*.jsonl   # (b) rates per bit x time
+```
+
+- **Occupancy:** live bit x time over the register bit x time, per kernel and class, against used and allocated registers. Also the share of the whole file of an SM, from the
+  resident warps, with the 256 KiB of the specs, not measured.
+- **Reweighting:** a campaign draws writes, so a value that lives 1000 instructions counts as one that lives 1. Weight of a run: mean live time of its site x destinations of the
+  instruction x bits. `reweight` writes the live time of each sampled instance in `.samples.jsonl`. `dead_effects` lists the runs that changed the outcome on a site never read: these must not exist.
+
+Limits:
+
+- **Cycles are almost all tool time:** about 24000 cycles per instruction on `k_walk`, far above a real instruction. Shares in cycles are therefore close to those in instructions (gemm_core GPR 0.684 and 0.670), and do not show real latency. Use instructions. The residents per SM and the share of the file are also measured under the tool.
+- **Register level, not bit level:** reading a value makes all its bits live, also where the instruction ignores some.
+- **Site level for instances:** the same `inst_id` does not hit the same thread twice, so an instance gets the mean of its site, not its own lifetime.
+- **Time of the flip:** the injector flips right after the write, so all the reads see it. A flip later in the interval misses the earlier reads, so reweighted rates are an upper bound on that side.
+- **Implicit sources:** only the operands named in the SASS. `reads_no_write` counts the reads of a register no instruction wrote: 0 on gemm, cnn and ptr_chase. `CALL`/`RET` (sfu_math) were not run here.
+
+Validation: 40 offline source cases, `make -C tests check`. By hand on `k_walk`: `FFMA R0` 6 instructions (one loop), `LDC R1` and `HFMA2 R0` dead. Writes per instruction == profile on gemm and cnn, for `gp` and `uniform`. Output equal to the golden. On 6000 `final-v1` runs on gemm and 200 on cnn, the only runs with an effect on a dead site were the 6 on R1.
+
 ## Injection log and results
 
 `nvbitfi-injection-log-temp.txt` now also contains `regType` (GPR/PR/UR/UP), `smID`, `warpID` (hardware warp slot), `laneID`, `ctaID` and `groupInstrs`. `groupInstrs` is the number of injectable instances of the group in the kernel; it must match the profile.
