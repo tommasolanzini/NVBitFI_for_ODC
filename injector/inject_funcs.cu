@@ -140,6 +140,7 @@ extern "C" __device__ __noinline__ void inject_select(uint64_t piinfo, uint64_t 
 	if (igid == G_GPPR) { elig = flags & FLAG_ELIG_GPPR; ctr = NUM_OPCODE_COUNTERS + G_GPPR; }
 	else if (igid == G_GP) { elig = flags & FLAG_ELIG_GP; ctr = NUM_OPCODE_COUNTERS + G_GP; }
 	else if (igid == G_ADDR) { elig = flags & FLAG_ELIG_ADDR; ctr = NUM_OPCODE_COUNTERS + G_ADDR; }
+	else if (igid == G_ADDR_STORE) { elig = flags & FLAG_ELIG_ADDR_STORE; ctr = NUM_OPCODE_COUNTERS + G_ADDR_STORE; }
 	else { elig = (grp == igid) && (flags & FLAG_ELIG_OWN); ctr = NUM_OPCODE_COUNTERS + igid; }
 	if (!elig) return; // static property: the whole warp returns together
 
@@ -197,11 +198,29 @@ extern "C" __device__ __noinline__ void inject_select(uint64_t piinfo, uint64_t 
 	}
 }
 
+// nvbit_write_upred_reg() sets R5 of the calling thread to 0 (measured, always R5, see
+// README). The other GPRs are compared too, because nothing documents this. R1 stays out:
+// it is the stack pointer of the tool code and it is never written from here.
+#define MAX_GPRS_KEPT 64
+__inline__ __device__ void write_upred_keep_gprs(unsigned int value, int maxGpr) {
+	unsigned int saved[MAX_GPRS_KEPT];
+	const int n = maxGpr < MAX_GPRS_KEPT ? maxGpr : MAX_GPRS_KEPT;
+	for (int q = 0; q < n; q++) if (q != STACK_POINTER_GPR) saved[q] = nvbit_read_reg((uint64_t)q);
+	nvbit_write_upred_reg((int32_t)value);
+	for (int q = 0; q < n; q++) {
+		if (q != STACK_POINTER_GPR && (unsigned int)nvbit_read_reg((uint64_t)q) != saved[q]) nvbit_write_reg((uint64_t)q, saved[q]);
+	}
+}
+
+// DUMMY=1: nothing is written. DUMMY=2: the unchanged value is written back, to test
+// the write path too. In both cases the values stay the original ones.
+#define WRITE_REGS (DUMMY != 1)
+
 // ---------------------------------------------------------------------------
 // AFTER: corrupt one destination of the selected instance
 // ---------------------------------------------------------------------------
 extern "C" __device__ __noinline__ void inject_error(uint64_t piinfo, uint64_t pshadow, uint64_t pverbose_device,
-		int offset, uint32_t gprRange, uint32_t prMask, uint32_t urRange, uint32_t upMask, int maxGpr, int maxUr, int skipGpr, int regval) {
+		int offset, uint32_t gprRange, uint32_t prMask, uint32_t urRange, uint32_t upMask, int maxGpr, int maxUr, int skipGpr, int regval, int upredValue) {
 	inj_info_t* inj_info = (inj_info_t*)piinfo;
 	volatile inj_shadow_t *rec = (volatile inj_shadow_t *)pshadow;
 	uint32_t verbose_device = *((uint32_t *)pverbose_device);
@@ -258,14 +277,14 @@ extern "C" __device__ __noinline__ void inject_error(uint64_t piinfo, uint64_t p
 		unsigned int after = (DUMMY || r == skipGpr) ? before : (before ^ mask);
 		if (leader) record_injection(rec, REG_GPR, r, mask, before, after);
 		record_cell(rec, laneCell, r, lane, mask, before, after);
-		if (!DUMMY && r != skipGpr) nvbit_write_reg((uint64_t)r, after);
+		if (WRITE_REGS && r != skipGpr) nvbit_write_reg((uint64_t)r, after);
 		if (model == MCU_ADJ_REGS) {
 			rec->requestedCells = k;
 			for (int j = 1; j < k && r + j < maxGpr; j++) {
 				const unsigned int b = nvbit_read_reg((uint64_t)(r + j));
 				const unsigned int a = (DUMMY || r + j == skipGpr) ? b : (b ^ mask);
 				record_cell(rec, j, r + j, lane, mask, b, a);
-				if (!DUMMY && r + j != skipGpr) nvbit_write_reg((uint64_t)(r + j), a);
+				if (WRITE_REGS && r + j != skipGpr) nvbit_write_reg((uint64_t)(r + j), a);
 				numCells++;
 			}
 		}
@@ -276,7 +295,7 @@ extern "C" __device__ __noinline__ void inject_error(uint64_t piinfo, uint64_t p
 		unsigned int shown = DUMMY ? before : after;
 		if (leader) record_injection(rec, REG_PR, p, before ^ after, before, shown);
 		record_cell(rec, laneCell, p, lane, before ^ after, before, shown);
-		if (!DUMMY) nvbit_write_pred_reg((int32_t)after);
+		if (WRITE_REGS) nvbit_write_pred_reg((int32_t)shown);
 	} else if ((d -= candP) < candU) {                 // ---- uniform register ----
 		int r = uBase + d;
 		unsigned int before = nvbit_read_ureg((uint64_t)r);
@@ -284,26 +303,26 @@ extern "C" __device__ __noinline__ void inject_error(uint64_t piinfo, uint64_t p
 		unsigned int after = DUMMY ? before : (before ^ mask);
 		record_injection(rec, REG_UR, r, mask, before, after);
 		record_cell(rec, 0, r, lane, mask, before, after);
-		if (!DUMMY) nvbit_write_ureg((uint64_t)r, after);
+		if (WRITE_REGS) nvbit_write_ureg((uint64_t)r, after);
 		if (model == MCU_ADJ_REGS) {
 			rec->requestedCells = k;
 			for (int j = 1; j < k && r + j < maxUr; j++) {
 				const unsigned int b = nvbit_read_ureg((uint64_t)(r + j));
 				const unsigned int a = DUMMY ? b : (b ^ mask);
 				record_cell(rec, j, r + j, lane, mask, b, a);
-				if (!DUMMY) nvbit_write_ureg((uint64_t)(r + j), a);
+				if (WRITE_REGS) nvbit_write_ureg((uint64_t)(r + j), a);
 				numCells++;
 			}
 		}
 	} else {                                           // ---- uniform predicate UP0-UP6 ----
 		d -= candU;
 		int p = nth_set_bit(upMask, d);
-		unsigned int before = (unsigned int)nvbit_read_upred_reg();
+		unsigned int before = (unsigned int)upredValue; // not nvbit_read_upred_reg(): it changes the run, see README
 		unsigned int after = corrupt_pred(model, k, seed, before, p);
 		unsigned int shown = DUMMY ? before : after;
 		record_injection(rec, REG_UP, p, before ^ after, before, shown);
 		record_cell(rec, 0, p, lane, before ^ after, before, shown);
-		if (!DUMMY) nvbit_write_upred_reg((int32_t)after);
+		if (WRITE_REGS) write_upred_keep_gprs(shown, maxGpr);
 	}
 	if (leader) {
 		rec->numCells = (model == MCU_ADJ_LANES) ? __popc(laneMask) : numCells;
@@ -401,7 +420,7 @@ extern "C" __device__ __noinline__ void inject_addr_flip(uint64_t piinfo, uint64
 	inj_info->addrRestore = !isDest;
 	inj_info->addrDone = false;
 	inj_info->errorInjected = true;
-	if (!DUMMY) addr_write(kind, r, after);
+	if (WRITE_REGS) addr_write(kind, r, shown);
 }
 
 // AFTER: back to the original value, unless the instruction wrote that register
@@ -411,7 +430,7 @@ extern "C" __device__ __noinline__ void inject_addr_restore(uint64_t piinfo, uin
 	volatile inj_shadow_t *rec = (volatile inj_shadow_t *)pshadow;
 	inj_info->addrDone = true;
 	if (inj_info->addrRestore) {
-		if (!DUMMY) addr_write(inj_info->addrKind, inj_info->addrReg, inj_info->addrOld);
+		if (WRITE_REGS) addr_write(inj_info->addrKind, inj_info->addrReg, inj_info->addrOld);
 		rec->addrRestored = 1;
 	} else {
 		rec->addrOverwritten = 1;

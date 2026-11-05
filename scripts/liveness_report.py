@@ -20,9 +20,10 @@ PRED_REGS = 7
 # Spec of the GB207 (CLAUDE.md), not measured: only for the share of the whole file
 RF_BYTES_PER_SM = 256 * 1024
 # Destination classes a group can draw, as in inject_error
-GROUP_CLASSES = {"gp": ("GPR",), "gppr": ("GPR", "PR"), "addr": ()}
+GROUP_CLASSES = {"gp": ("GPR",), "gppr": ("GPR", "PR"), "addr": (), "addr_store": ()}
 SDC = (16, 17, 18)
 MASKED = (1, 2, 3)
+DOMINATED_SHARE = 0.5
 
 
 def load(path):
@@ -122,6 +123,7 @@ def reweight(table, results):
 		total_w = sum_w2 = 0.0
 		missing = 0
 		dead_effects = []
+		by_site = collections.Counter()
 		for r in rows:
 			c = outcome_class(r["outcome"])
 			raw[c] += 1
@@ -132,12 +134,17 @@ def reweight(table, results):
 			weighted[c] += w
 			total_w += w
 			sum_w2 += w * w
+			by_site[(r["kernel"][:24], r["pc"], "%s%d" % (r["reg_type"], r["reg_no"]))] += w
 			s = table[(r["kernel"], int(r["pc"], 16), r["reg_type"], r["reg_no"])]
 			if c != "masked" and s["live"] == 0:
 				dead_effects.append({"kernel": r["kernel"][:24], "pc": r["pc"], "reg": "%s%d" % (r["reg_type"], r["reg_no"]), "outcome": c, "icount": r.get("icount")})
 		out[group] = {"runs": len(rows), "missing_sites": missing, "raw": dict(raw),
 			"weighted": {k: v / total_w for k, v in weighted.items()} if total_w else {},
 			"effective_runs": total_w * total_w / sum_w2 if sum_w2 else 0.0, "dead_effects": dead_effects}
+		# A rate that one site decides describes that site, not the group
+		if by_site and total_w:
+			site_id, w = by_site.most_common(1)[0]
+			out[group]["top_site"] = {"site": list(site_id), "share": w / total_w, "dominated": w / total_w > DOMINATED_SHARE}
 	return out
 
 
@@ -168,7 +175,7 @@ def main():
 				if r.get("reg_type") in BITS and r.get("injected"):
 					f.write(json.dumps(sample_row(table, r)) + "\n")
 		for g, e in out.items():
-			print(g, "runs", e["runs"], "missing", e["missing_sites"], "raw", e["raw"], "weighted", {k: round(v, 3) for k, v in e["weighted"].items()}, "effective %.0f" % e["effective_runs"], "dead effects", len(e["dead_effects"]))
+			print(g, "runs", e["runs"], "missing", e["missing_sites"], "raw", e["raw"], "weighted", {k: round(v, 3) for k, v in e["weighted"].items()}, "effective %.0f" % e["effective_runs"], "dead effects", len(e["dead_effects"]), ("DOMINATED by %s, %.0f%% of the weight" % (e["top_site"]["site"], 100 * e["top_site"]["share"])) if e.get("top_site", {}).get("dominated") else "")
 			for d in e["dead_effects"][:8]:
 				print("   ", d)
 	else:

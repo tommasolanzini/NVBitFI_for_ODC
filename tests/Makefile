@@ -11,6 +11,7 @@ check: dests_test
 	./dests_test --check
 	python3 test_fp_signature.py
 	python3 test_liveness.py
+	python3 test_final_block.py
 
 clean:
 	rm -f dests_test

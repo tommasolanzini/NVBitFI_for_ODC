@@ -143,6 +143,7 @@ std::string removeSpaces(const char * str) {
 inline uint32_t eligibility_flags(int grp, const DestInfo &d, const AddrInfo &a) {
 	uint32_t f = 0;
 	if (a.total_bits() > 0) f |= FLAG_ELIG_ADDR;
+	if (a.access == MA_STORE && a.part[AP_RA].sig + a.part[AP_UR].sig > 0) f |= FLAG_ELIG_ADDR_STORE;
 	if (grp == G_UNIFORM) f |= FLAG_UNIFORM;
 	if (grp == G_NODEST || grp == G_UNKNOWN) {
 		f |= FLAG_ELIG_OWN; // counted (statistics only), never injected
@@ -267,7 +268,6 @@ inline SrcInfo instr_sources(Instr *i, const StaticInstInfo &si) {
 
 // The ABI stack pointer. NVBit's own instrumentation uses it to reach memory, whether
 // or not the application does: see "The stack pointer" in README.md.
-static const int STACK_POINTER_GPR = 1;
 
 inline bool reads_gpr(const std::vector<Instr *> &instrs, int reg) {
 	for (Instr *i : instrs) {

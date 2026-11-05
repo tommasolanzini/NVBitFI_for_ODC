@@ -108,9 +108,10 @@ G_UNKNOWN = 10 # not really an igid: opcodes missing from arch.h, never injected
 G_GPPR = 11    # aggregate: instructions that write a GPR or a predicate register
 G_GP = 12      # aggregate: instructions that write a GPR (original NVBitFI default)
 G_ADDR = 13    # aggregate: a register of the address of a memory instruction, corrupted for that instruction only
-NUM_INST_GROUPS = 14
+G_ADDR_STORE = 14 # aggregate: as G_ADDR, stores only, Rn or URn of the address and not the descriptor
+NUM_INST_GROUPS = 15
 
-IGID_STR = [ "fp64", "fp32", "ld", "pr", "nodest", "others", "tc", "sfu", "fp16", "uniform", "unknown", "gppr", "gp", "addr" ]
+IGID_STR = [ "fp64", "fp32", "ld", "pr", "nodest", "others", "tc", "sfu", "fp16", "uniform", "unknown", "gppr", "gp", "addr", "addr_store" ]
 
 # Register class of the corrupted destination (RegType in arch.h)
 REG_TYPE_STR = [ "GPR", "PR", "UR", "UP" ]

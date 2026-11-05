@@ -94,6 +94,8 @@ def main():
 	# 	print ("Only one mode is currently supported: inst_value")
 	# 	exit(1)
 	inj_mode = "inst_value" # we only support inst_value mode in NVBitFI as of now (March 25, 2020)
+	if os.environ.get("NVBITFI_SEED"): # the list of a campaign can be regenerated
+		random.seed(int(os.environ["NVBITFI_SEED"]))
 	
 	# actual code that generates list per app is here
 	for app in (sys.argv[1:] or p.apps): # optional: only the apps named on the command line

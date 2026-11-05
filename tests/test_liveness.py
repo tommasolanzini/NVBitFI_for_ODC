@@ -57,6 +57,10 @@ long_short = {"sites": [site(0, 0, 0, 1, 90), site(16, 0, 0, 1, 10)], "kernel": 
 t2 = lr.site_table([long_short])
 out = lr.reweight(t2, [run(0, 0, 17), run(16, 0, 1)])["gp"]
 check("raw is 50/50", out["raw"], {"sdc": 1, "masked": 1})
+check("one site decides", (out["top_site"]["dominated"], out["top_site"]["site"][1]), (True, "0x0"))
+check("share of that site", out["top_site"]["share"], 0.9)
+even = lr.reweight(lr.site_table([{"kernel": "k", "sites": [site(0, 0, 0, 1, 10), site(16, 0, 0, 1, 10), site(32, 0, 0, 1, 10)]}]), [run(0, 0, 17), run(16, 0, 1), run(32, 0, 1)])["gp"]
+check("no site decides", even["top_site"]["dominated"], False)
 check("weighted sdc", out["weighted"]["sdc"], 0.9)
 check("effective runs", out["effective_runs"], 100.0 ** 2 * (32 ** 2) / ((90.0 ** 2 + 10.0 ** 2) * (32 ** 2)))
 

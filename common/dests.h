@@ -49,7 +49,7 @@ static const char *instTypeNames[NUM_OPCODE_COUNTERS] = {
 #undef NVBITFI_OPCODE_GROUP
 
 static const char *instGrouptNames[NUM_INST_GROUPS] = {
-	"fp64", "fp32", "ld", "pr", "nodest", "others", "tc", "sfu", "fp16", "uniform", "unknown", "gppr", "gp", "addr"
+	"fp64", "fp32", "ld", "pr", "nodest", "others", "tc", "sfu", "fp16", "uniform", "unknown", "gppr", "gp", "addr", "addr_store"
 };
 
 [[maybe_unused]] static const char *regTypeNames[NUM_REG_TYPES] = { "GPR", "PR", "UR", "UP" };

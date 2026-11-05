@@ -224,7 +224,7 @@ void parse_params(std::string filename) {
 			// a uniform register has one value per warp: it has no lanes
 			assert(inj_info.bitFlipModel != MCU_ADJ_LANES || inj_info.groupID != G_UNIFORM);
 			// the address model flips one bit, of one register, for one instruction
-			assert(inj_info.groupID != G_ADDR || inj_info.bitFlipModel == FLIP_SINGLE_BIT);
+			assert((inj_info.groupID != G_ADDR && inj_info.groupID != G_ADDR_STORE) || inj_info.bitFlipModel == FLIP_SINGLE_BIT);
 
 			ifs >> inj_info.kernelName;
 			ifs >> inj_info.kernelCount;
@@ -313,6 +313,7 @@ static bool relevant_for_group(const StaticInstInfo &si, int igid) {
 	if (igid == G_GPPR) return si.flags & FLAG_ELIG_GPPR;
 	if (igid == G_GP) return si.flags & FLAG_ELIG_GP;
 	if (igid == G_ADDR) return si.flags & FLAG_ELIG_ADDR;
+	if (igid == G_ADDR_STORE) return si.flags & FLAG_ELIG_ADDR_STORE;
 	return si.group == igid && (si.flags & FLAG_ELIG_OWN);
 }
 
@@ -392,7 +393,7 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func) {
 			nvbit_add_call_arg_const_val32(i, si.flags); // eligibility flags
 			nvbit_add_call_arg_guard_pred_val(i); // predicate value
 
-			if (inj_info.groupID == G_ADDR) {
+			if (inj_info.groupID == G_ADDR || inj_info.groupID == G_ADDR_STORE) {
 				/* BEFORE: corrupt one register of the address. AFTER: restore it */
 				nvbit_insert_call(i, "inject_addr_flip", IPOINT_BEFORE);
 				nvbit_add_call_arg_const_val64(i, (uint64_t)&inj_info);
@@ -401,7 +402,8 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func) {
 				nvbit_add_call_arg_const_val32(i, i->getOffset());
 				nvbit_add_call_arg_const_val32(i, pack_part(si.addr.part[AP_RA]));
 				nvbit_add_call_arg_const_val32(i, pack_part(si.addr.part[AP_UR]));
-				nvbit_add_call_arg_const_val32(i, pack_part(si.addr.part[AP_DESC]));
+				// the store stratum looks for stores that land elsewhere: a flip in the descriptor moves no address
+				nvbit_add_call_arg_const_val32(i, inj_info.groupID == G_ADDR_STORE ? 0u : pack_part(si.addr.part[AP_DESC]));
 				nvbit_add_call_arg_const_val32(i, ((uint32_t)si.addr.raStride << 8) | (si.addr.raUnsigned ? 2u : 0u) | (si.addr.ra64 ? 1u : 0u));
 				nvbit_add_call_arg_const_val32(i, si.addr.ur64 ? 1u : 0u);
 				nvbit_add_call_arg_const_val32(i, si.addr.access);
@@ -433,6 +435,7 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func) {
 			} else {
 				nvbit_add_call_arg_const_val32(i, (unsigned int)-1);
 			}
+			nvbit_add_call_arg_upred_reg(i); // value after the instruction
 		}
 		fout << "num_instrumented_instrs: " << num_instrumented << std::endl;
 	}

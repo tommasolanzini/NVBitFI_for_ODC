@@ -116,6 +116,16 @@ descriptor apart. Location check: 475/486 register SDCs inside the expected elem
 (ptr_chase, `k_walk`, FFMA R0-R2, 24 wrong elements across the warp) is not explained yet. `MCU_ADJ_REGS` can write
 fewer cells than asked (574 of 590) because the range stops at the highest register the function names.
 
+## Uniform predicates: reads and writes through NVBit
+
+`nvbit_read_upred_reg()` and `nvbit_write_upred_reg()` change the run by themselves on this setup (NVBit 1.8, sm_120): with no value changed, a loop-control `UISETP` in `k_fc` of cnn crashed 28/28 runs (Xid 31) and `UISETP` at 0x7f0 of `gemm_tc` gave 2/2 SDCs. Comparing the registers across the write shows the cause: R5 of the calling thread becomes 0, in every run checked, and no other GPR or uniform register changes. R1 was left out of the comparison.
+
+So the injector takes the value from `nvbit_add_call_arg_upred_reg()`, which changes nothing, and saves and restores the GPRs around the write (`write_upred_keep_gprs`). Checked on the same sites: writing the same value back gives 11/11 Masked on uniform predicate sites, and a real flip reaches both the argument and the read of a later call on the same instruction. `nvbit_read_pred_reg()` and `nvbit_write_pred_reg()` showed no such change on 24 sites of `gemm_core`.
+
+**`DUMMY=2`** writes the unchanged value back, so a gate also runs the write path, which `DUMMY=1` skips. `run_final_block.py` uses it. Without it a write that perturbs the run cannot be seen.
+
+Older data: every run on a uniform predicate before this fix has R5 at 0 in the injecting thread, on top of the flip. In `final-v1` and the 2026-11-03 pilot that is 19 of the 1000 uniform runs (all `gemm_tc`: 10 crash, 9 SDC); do not use them.
+
 ## The stack pointer (R1)
 
 The kernels of all the workloads start with `LDC R1, c[0x0][0x37c]` and then never read R1: it is the ABI stack pointer, and they use no stack. NVBit's
@@ -158,10 +168,15 @@ Limits:
 - **Cycles are almost all tool time:** about 24000 cycles per instruction on `k_walk`, far above a real instruction. Shares in cycles are therefore close to those in instructions (gemm_core GPR 0.684 and 0.670), and do not show real latency. Use instructions. The residents per SM and the share of the file are also measured under the tool.
 - **Register level, not bit level:** reading a value makes all its bits live, also where the instruction ignores some.
 - **Site level for instances:** the same `inst_id` does not hit the same thread twice, so an instance gets the mean of its site, not its own lifetime.
+- **A rate decided by one site:** `reweight` reports `top_site` and marks a group `dominated` when one site has over 50% of the weight. Such a rate describes that site, not the group. **gemm `pr` on bit x time is this case:** one site, `ISETP.NE P0, R5` at 0xd0 of `gemm_core`, has 75% of the weight and is Masked in 57/57 runs, because it tests the remainder loops, which N=128 never runs (inferred from SASS and outcomes). Do not use it as the general rate of predicate registers.
 - **Time of the flip:** the injector flips right after the write, so all the reads see it. A flip later in the interval misses the earlier reads, so reweighted rates are an upper bound on that side.
 - **Implicit sources:** only the operands named in the SASS. `reads_no_write` counts the reads of a register no instruction wrote: 0 on gemm, cnn and ptr_chase. `CALL`/`RET` (sfu_math) were not run here.
 
 Validation: 40 offline source cases, `make -C tests check`. By hand on `k_walk`: `FFMA R0` 6 instructions (one loop), `LDC R1` and `HFMA2 R0` dead. Writes per instruction == profile on gemm and cnn, for `gp` and `uniform`. Output equal to the golden. On 6000 `final-v1` runs on gemm and 200 on cnn, the only runs with an effect on a dead site were the 6 on R1.
+
+## Stores only (group 14)
+
+`G_ADDR_STORE` is the address model restricted to stores, and to the address register or the UR of the address, not to the descriptor. So every run moves a store, and `store_wrong_location` has enough runs: stores are too rare for it in group 13. The rate is conditional on a flip in a store address: to compare it with group 13, reweight it by the share of stores.
 
 ## Injection log and results
 

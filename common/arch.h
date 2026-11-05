@@ -62,6 +62,7 @@ enum GroupType {
 	G_GPPR,      // aggregate: writes a GPR or a predicate register
 	G_GP,        // aggregate: writes a GPR
 	G_ADDR,      // aggregate: memory instruction with a register in its address
+	G_ADDR_STORE, // aggregate: store with a register in its address, descriptor excluded
 	NUM_INST_GROUPS
 };
 
@@ -203,6 +204,10 @@ enum RegType {
 #define FLAG_ELIG_GP    0x4  // counted in G_GP (writes a GPR)
 #define FLAG_UNIFORM    0x8  // uniform-datapath instruction: executes once per warp
 #define FLAG_ELIG_ADDR  0x10 // counted in G_ADDR (register in the address of a memory instruction)
+#define FLAG_ELIG_ADDR_STORE 0x20 // counted in G_ADDR_STORE (store, Rn or URn in its address)
+
+// R1 is the ABI stack pointer, used by NVBit's code too (see README)
+static const int STACK_POINTER_GPR = 1;
 
 // List of the Bit Flip Models
 // For 1-bit destinations (predicates) FLIP_SINGLE_BIT and FLIP_TWO_BITS both
