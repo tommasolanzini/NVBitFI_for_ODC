@@ -21,6 +21,8 @@ CNN_BATCH = 32 # logits: row = image, column = class
 CNN_C1, CNN_C2, CNN_W1, CNN_P1, CNN_W2, CNN_FLAT = 4, 8, 30, 15, 13, 288
 
 OUTPUTS = {"gemm": ["output_core.bin", "output_tc.bin"], "ptr_chase": ["output_ptr.bin"], "shm_stencil": ["output_shm.bin"], "cnn": ["output_logits.bin"]}
+SFU_FUNCS = ["rsqrt", "rcp", "sin", "exp", "log"] # in launch order
+OUTPUTS["sfu_math"] = ["output_%s.bin" % f for f in SFU_FUNCS]
 GEMM_BUFFERS = {0: "A", 1: "B", 2: "C", 3: "C_tc", 4: "A_h", 5: "B_h"}
 SDC = (16, 17, 18)
 
@@ -66,6 +68,16 @@ def cnn_col(cls):
 	return {r * CNN_BATCH + cls for r in range(CNN_BATCH)}
 
 
+# Function of a sfu_math kernel: k_rsqrt(floatconst*,float*,int) -> rsqrt
+def sfu_func(kernel):
+	return kernel.split("(")[0][len("k_"):]
+
+
+# This kernel and the later ones read the same input and each has its own output
+def sfu_from(kernel):
+	return SFU_FUNCS[SFU_FUNCS.index(sfu_func(kernel)):]
+
+
 def warp_of_tid(tid):
 	return {tid - tid % 32 + i for i in range(32)}
 
@@ -79,6 +91,9 @@ def expected_threads(app, rec):
 		return {"output_shm.bin": {rec["cta"] * N_SHM + c for c in range(N_SHM)}} # the window of a CTA is one row
 	if app == "cnn":
 		return {"output_logits.bin": cnn_row(rec["cta"] % CNN_BATCH)} # first index of the CTA = image, in every kernel
+	if app == "sfu_math":
+		s = set().union(*[warp_of_tid(t) for t in tids]) if wide else tids
+		return {"output_%s.bin" % f: (s if f == sfu_func(kernel) else set()) for f in SFU_FUNCS}
 	if app == "gemm":
 		if kernel.startswith("gemm_tc"):
 			return {"output_core.bin": set(), "output_tc.bin": tile_of_cta(rec["cta"])}
@@ -96,6 +111,11 @@ def landing_effect(app, rec):
 		return {} # another word of the same window: same row as the CTA
 	if app == "cnn":
 		return mem_word_effect(app, b, off)
+	if app == "sfu_math":
+		# buffer 0 = in, read by this kernel and the later ones; 1 = out, cleared before each launch
+		if b == 0: return {"output_%s.bin" % f: {off // 4} for f in sfu_from(rec.get("kernel", ""))}
+		if b == 1: return {"output_%s.bin" % sfu_func(rec.get("kernel", "")): {off // 4}}
+		return {}
 	if app == "gemm":
 		i = off // 4
 		if b == 2: return {"output_core.bin": {i}}

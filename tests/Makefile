@@ -12,6 +12,7 @@ check: dests_test
 	python3 test_fp_signature.py
 	python3 test_liveness.py
 	python3 test_final_block.py
+	python3 test_fault_locations.py
 
 clean:
 	rm -f dests_test
