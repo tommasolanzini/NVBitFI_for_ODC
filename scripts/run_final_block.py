@@ -17,6 +17,8 @@
 # Exit code: 0 done, 2 stopped by a gate or a check. The reason is in <root>/STOPPED.txt.
 
 import argparse, glob, hashlib, json, os, re, shutil, subprocess, sys, time, zlib
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import run_tmp as cf
 
 GATE_DUMMY = 2
 
@@ -35,6 +37,7 @@ S_MEM = {("gemm", "a"): 1.24, ("gemm", "b"): 1.24, ("ptr_chase", "a"): 1.33, ("p
 
 MASKED = (1, 2, 3)
 SUSPENDED_S = 0.5
+MIN_FREE_BYTES = 10 * 1024**3 # before every cell; the disk filled up on 2026-11-06
 
 
 # Runs per k: mcu_sizes.py default without size 1, at least 1/6 of the cell at k=4
@@ -243,6 +246,9 @@ class Driver:
 		for f in glob.glob("/proc/acpi/button/lid/*/state"):
 			if "closed" in open(f).read():
 				problems.append("lid closed")
+		free = cf.free_bytes((self.root, "/tmp"))
+		if free < MIN_FREE_BYTES:
+			problems.append("only %.1f GB free on disk, at least %.0f needed" % (free / 1024**3, MIN_FREE_BYTES / 1024**3))
 		if first:
 			apps = subprocess.run(["nvidia-smi", "--query-compute-apps=pid,name", "--format=csv,noheader"], stdout=subprocess.PIPE, universal_newlines=True).stdout.strip()
 			if apps:
@@ -354,7 +360,12 @@ class Driver:
 		base = "%s/%s" % (self.root, stage)
 		os.makedirs(base, exist_ok=True)
 		start = time.monotonic()
-		records = (self.run_reg if c.tool == "reg" else self.run_mem)(c, stage, base)
+		tmp_before = cf.nvbit_tmp_entries()
+		try:
+			records = (self.run_reg if c.tool == "reg" else self.run_mem)(c, stage, base)
+		finally: # second line of defence: the runs remove their own (common_functions.RunTmp)
+			for e in cf.nvbit_tmp_entries() - tmp_before:
+				cf.remove_tmp_entry(e)
 		seconds = time.monotonic() - start
 		suspended = sum(r.get("suspended_s", 0) > SUSPENDED_S for r in records)
 		self.log(stage=stage, cell=c.name, runs=len(records), of=c.n, seconds=round(seconds, 1), suspended=suspended, gpu=self.gpu_state())

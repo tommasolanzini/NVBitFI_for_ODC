@@ -107,6 +107,8 @@ def get_injection_site_info(countList, inj_num, igid):
 def suspended_seconds():
 	return time.clock_gettime(time.CLOCK_BOOTTIME) - time.clock_gettime(time.CLOCK_MONOTONIC)
 
+from run_tmp import RunTmp # temporary files of one run, removed when it ends
+
 def sha256_of(path):
 	if not os.path.isfile(path):
 		return None

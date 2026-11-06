@@ -45,7 +45,8 @@ def phase_run(app, base, phase, name=None):
 	os.makedirs(run_dir)
 	os.environ["MEMINJ_PHASE"] = phase
 	os.environ["MEMINJ_EVENTS"] = run_dir + "/events.jsonl"
-	rc = run_workload(app, run_dir).wait()
+	with cf.RunTmp():
+		rc = run_workload(app, run_dir).wait()
 	del os.environ["MEMINJ_PHASE"], os.environ["MEMINJ_EVENTS"]
 	if rc != 0:
 		sys.exit("%s run failed with exit code %d" % (phase, rc))
@@ -185,8 +186,9 @@ def run_target(a, base, t, out_name):
 	dmesg_before = roi.cmdline("dmesg")
 	cwd = os.getcwd()
 	os.chdir(run_dir)
-	pr = run_workload(a.app, run_dir)
-	timeout_flag, retcode = roi.is_timeout(a.app, pr)
+	with cf.RunTmp(): # NVBit temporary files removed also after a crash or a timeout
+		pr = run_workload(a.app, run_dir)
+		timeout_flag, retcode = roi.is_timeout(a.app, pr)
 	dmesg_delta = roi.get_dmesg_delta(dmesg_before, roi.cmdline("dmesg")).replace("\n", "; ").replace(":", "-")
 	log = roi.read_inj_log()
 	rec = dict(t)

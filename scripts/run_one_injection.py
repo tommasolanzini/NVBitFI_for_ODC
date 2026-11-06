@@ -365,9 +365,9 @@ def run_one_injection_job(inj_mode, igid, bfm, app, kname, kcount, iid, opid, bi
 	if p.verbose: start_main = datetime.datetime.now() # current time
 	cmd = p.script_dir[app] + "/" + p.run_script + " " + p.apps[app][4]
 	if p.verbose: print (cmd)
-	pr = subprocess.Popen(cmd, shell=True, executable='/bin/bash', preexec_fn=os.setsid) # run the injection job
-
-	[timeout_flag, retcode] = is_timeout(app, pr)
+	with cf.RunTmp(): # NVBit temporary files removed also after a crash or a timeout
+		pr = subprocess.Popen(cmd, shell=True, executable='/bin/bash', preexec_fn=os.setsid) # run the injection job
+		[timeout_flag, retcode] = is_timeout(app, pr)
 	if p.verbose: print ("App runtime: " + str(get_seconds(datetime.datetime.now() - start_main)))
 
 	# Record kernel error messages (dmesg)
