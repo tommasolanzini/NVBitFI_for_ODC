@@ -8,6 +8,8 @@
 
 import filecmp, glob, os, subprocess, sys, time
 
+from run_tmp import RunTmp
+
 ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 
@@ -15,10 +17,12 @@ def main():
 	app, out = sys.argv[1], os.path.abspath(sys.argv[2])
 	os.makedirs(out, exist_ok=True)
 	app_dir = os.path.join(ROOT, "test-apps", app)
-	env = dict(os.environ, NOBANNER="1", ACK_CTX_INIT_LIMITATION="1", BIN_DIR=app_dir, BIN_PATH=app_dir, APP_DIR=app_dir,
-		PRELOAD_FLAG="LD_PRELOAD=" + os.path.join(ROOT, "liveness", "liveness.so"), LIVE_OUT=os.path.join(out, "liveness.jsonl"))
 	start = time.monotonic()
-	rc = subprocess.call([os.path.join(app_dir, "run.sh")], cwd=out, env=env, stdout=open(out + "/stdout.txt", "w"), stderr=open(out + "/stderr.txt", "w"))
+	with RunTmp(): # NVBit temporary files removed also after a crash; env built inside to get the run's TMPDIR
+		env = dict(os.environ, NOBANNER="1", ACK_CTX_INIT_LIMITATION="1", BIN_DIR=app_dir, BIN_PATH=app_dir, APP_DIR=app_dir,
+			PRELOAD_FLAG="LD_PRELOAD=" + os.path.join(ROOT, "liveness", "liveness.so"), LIVE_OUT=os.path.join(out, "liveness.jsonl"))
+		with open(out + "/stdout.txt", "w") as so, open(out + "/stderr.txt", "w") as se:
+			rc = subprocess.call([os.path.join(app_dir, "run.sh")], cwd=out, env=env, stdout=so, stderr=se)
 	seconds = time.monotonic() - start
 	same = {}
 	for golden in glob.glob(app_dir + "/golden_output*"):
