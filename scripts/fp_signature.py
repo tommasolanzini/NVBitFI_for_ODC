@@ -20,7 +20,7 @@ from array import array
 MIN_BLOCK_FILL = 0.5 # wrong elements / bounding box area to call it a block
 
 def classify_pattern(wrong, n):
-	"""wrong: flat row-major indices of the wrong elements of an n x n matrix."""
+	"""wrong: flat row-major indices of the wrong elements of a matrix with n columns."""
 	if not wrong:
 		return "none"
 	if len(wrong) == 1:
@@ -39,15 +39,17 @@ def bit_class(xor):
 		return "sign"
 	return "exponent" if xor >> 23 else "mantissa"
 
-def compare(out_bytes, golden_bytes):
-	"""Features of one matrix; out_bytes is None if the output does not exist."""
+def compare(out_bytes, golden_bytes, cols=None, wrong_out=None):
+	"""Features of one matrix; out_bytes is None if the output does not exist.
+	cols: columns of the matrix (default: square). wrong_out: list that receives
+	(flat index, output word XOR golden word) of each wrong element."""
 	if out_bytes is None:
 		return {"status": "missing"}
 	if len(out_bytes) != len(golden_bytes):
 		return {"status": "bad_size"}
 	out_bits = array("I", out_bytes)
 	golden_bits = array("I", golden_bytes)
-	n = math.isqrt(len(golden_bits))
+	n = cols or math.isqrt(len(golden_bits))
 
 	wrong = []
 	classes = {"sign": 0, "exponent": 0, "mantissa": 0}
@@ -58,6 +60,8 @@ def compare(out_bytes, golden_bytes):
 			continue
 		wrong.append(i)
 		classes[bit_class(o ^ g)] += 1
+		if wrong_out is not None:
+			wrong_out.append((i, o ^ g))
 		x, y = struct.unpack("<2f", struct.pack("<2I", o, g))
 		if not math.isfinite(x):
 			nonfinite += 1
@@ -73,10 +77,34 @@ def read_or_none(fname):
 	with open(fname, "rb") as f:
 		return f.read()
 
-def print_signature(app_dir, names):
-	"""Compare output_<name>.bin (current directory) with app_dir/golden_output_<name>.bin."""
+def print_signature(app_dir, names, cols=None, compact=False):
+	"""Compare output_<name>.bin (current directory) with app_dir/golden_output_<name>.bin.
+
+	compact (large outputs): write wrong-<name>.bin with the wrong elements only, as
+	little-endian uint32 pairs (flat index, output XOR golden), then remove the outputs.
+	write_wrong / read_wrong give the format; an empty file means no wrong element."""
 	sig = {}
 	for name in names:
 		with open(os.path.join(app_dir, "golden_output_%s.bin" % name), "rb") as f:
-			sig[name] = compare(read_or_none("output_%s.bin" % name), f.read())
+			wrong = [] if compact else None
+			out = read_or_none("output_%s.bin" % name)
+			sig[name] = compare(out, f.read(), cols, wrong)
+		if compact and out is not None:
+			if sig[name]["status"] == "ok":
+				write_wrong("wrong-%s.bin" % name, wrong)
+				os.remove("output_%s.bin" % name)
 	print(json.dumps(sig, allow_nan=False))
+
+def write_wrong(fname, pairs):
+	a = array("I")
+	for i, x in pairs:
+		a.extend((i, x))
+	with open(fname, "wb") as f:
+		a.tofile(f)
+
+def read_wrong(fname):
+	"""{flat index: output XOR golden} from a wrong-<name>.bin file."""
+	a = array("I")
+	with open(fname, "rb") as f:
+		a.frombytes(f.read())
+	return {a[k]: a[k + 1] for k in range(0, len(a), 2)}

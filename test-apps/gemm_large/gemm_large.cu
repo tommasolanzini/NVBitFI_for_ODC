@@ -6,8 +6,9 @@
  *  - gemm_core: one thread per element as before, but with 128 threads per CTA and a 2-D
  *    grid (row = blockIdx.x, column = blockIdx.y * 128 + threadIdx.x), since N > 1024
  *    does not fit in one CTA. For N = 128 the grid is the same as gemm.cu;
- *  - the outputs are not written in full (64 MB each at N = 4096): output_hash.txt has
- *    one FNV-1a hash per result matrix, enough to see that a tool did not change them.
+ *  - output_core.bin and output_tc.bin hold the full matrices, as in gemm.cu (64 MB each
+ *    at N = 4096), plus output_hash.txt with one FNV-1a hash per matrix. In the injection
+ *    campaigns signature.py keeps only the wrong elements and removes the .bin files.
  */
 
 #include <stdio.h>
@@ -81,6 +82,15 @@ static uint64_t fnv1a(const void *p, size_t bytes)
 	return h;
 }
 
+static void write_matrix(const char *name, const float *m, size_t count)
+{
+	FILE *f = fopen(name, "wb");
+	if (!f || fwrite(m, sizeof(float), count, f) != count || fclose(f) != 0) {
+		printf("Error: cannot write %s\n", name);
+		exit(1);
+	}
+}
+
 int main()
 {
 	setbuf(stdout, NULL);
@@ -117,6 +127,7 @@ int main()
 	cudaMemcpy(host_c, c, nn * sizeof(float), cudaMemcpyDeviceToHost);
 	check("copy core");
 	const uint64_t h_core = fnv1a(host_c, nn * sizeof(float));
+	write_matrix("output_core.bin", host_c, nn);
 
 	gemm_tc<<<dim3(N / TILE, N / TILE), 32>>>(a_h, b_h, c_tc, N);
 	cudaDeviceSynchronize();
@@ -124,6 +135,7 @@ int main()
 	cudaMemcpy(host_c, c_tc, nn * sizeof(float), cudaMemcpyDeviceToHost);
 	check("copy tc");
 	const uint64_t h_tc = fnv1a(host_c, nn * sizeof(float));
+	write_matrix("output_tc.bin", host_c, nn);
 
 	FILE *f = fopen("output_hash.txt", "w");
 	if (!f || fprintf(f, "core %016llx\ntc %016llx\n", (unsigned long long)h_core, (unsigned long long)h_tc) < 0 || fclose(f) != 0) {

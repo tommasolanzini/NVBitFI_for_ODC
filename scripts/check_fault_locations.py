@@ -10,14 +10,18 @@
 
 import glob, json, os, struct, sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from fp_signature import read_wrong  # noqa: E402
+
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
-N_GEMM = 128
+N_GEMM = 128 # set per workload by configure()
 TILE = 16
 N_PTR = 64 # 64 CTAs x 64 threads, element = list = tid
 LIST_LEN = 64
 NODE_BYTES = 16
 N_SHM = 128
-CNN_BATCH = 32 # logits: row = image, column = class
+CNN_BATCH = 32 # logits: row = image, column = class; set per workload by configure()
+CNN_CLASSES = 32
 CNN_C1, CNN_C2, CNN_W1, CNN_P1, CNN_W2, CNN_FLAT = 4, 8, 30, 15, 13, 288
 
 OUTPUTS = {"gemm": ["output_core.bin", "output_tc.bin"], "ptr_chase": ["output_ptr.bin"], "shm_stencil": ["output_shm.bin"], "cnn": ["output_logits.bin"]}
@@ -25,6 +29,19 @@ SFU_FUNCS = ["rsqrt", "rcp", "sin", "exp", "log"] # in launch order
 OUTPUTS["sfu_math"] = ["output_%s.bin" % f for f in SFU_FUNCS]
 GEMM_BUFFERS = {0: "A", 1: "B", 2: "C", 3: "C_tc", 4: "A_h", 5: "B_h"}
 SDC = (16, 17, 18)
+
+# Large variants (block 6): same kernels and buffers as the base workload, other sizes.
+# Their runs keep only wrong-<name>.bin (fp_signature.write_wrong), not the outputs.
+LARGE = {"gemm_n1024": ("gemm", {"N_GEMM": 1024}), "gemm_n2048": ("gemm", {"N_GEMM": 2048}), "cnn_large": ("cnn", {"CNN_BATCH": 256})}
+BASE_SIZES = {"N_GEMM": 128, "CNN_BATCH": 32}
+
+
+# Sets the sizes of a workload, returns the base workload whose rules apply
+def configure(app):
+	base, sizes = LARGE.get(app, (app, {}))
+	globals().update(BASE_SIZES)
+	globals().update(sizes)
+	return base
 
 
 def words(path):
@@ -35,6 +52,14 @@ def words(path):
 # {output file: set of flat indices that differ from the golden}, None if it is missing
 def wrong_elements(app, run_dir):
 	out = {}
+	base = configure(app)
+	if base != app:
+		for name in OUTPUTS[base]:
+			path = os.path.join(run_dir, "wrong-%s.bin" % name[len("output_"):-len(".bin")])
+			if not os.path.isfile(path):
+				return None
+			out[name] = set(read_wrong(path))
+		return out
 	for name in OUTPUTS[app]:
 		path = os.path.join(run_dir, name)
 		if not os.path.isfile(path):
@@ -44,6 +69,14 @@ def wrong_elements(app, run_dir):
 			return None
 		out[name] = {i for i, (x, y) in enumerate(zip(a, g)) if x != y}
 	return out
+
+
+# Element of gemm_core written by a flat thread index: CTA = (row, block of 128 columns),
+# flat CTA = row + N * column block (inject_funcs.cu get_flat_cta). N=128: element = tid.
+def gemm_core_element(tid):
+	cta, tx = divmod(tid, 128)
+	row, cblock = cta % N_GEMM, cta // N_GEMM
+	return row * N_GEMM + cblock * 128 + tx
 
 
 def tile_of_cta(cta):
@@ -61,11 +94,11 @@ def gemm_col(c):
 
 
 def cnn_row(img):
-	return {img * CNN_BATCH + c for c in range(CNN_BATCH)}
+	return {img * CNN_CLASSES + c for c in range(CNN_CLASSES)}
 
 
 def cnn_col(cls):
-	return {r * CNN_BATCH + cls for r in range(CNN_BATCH)}
+	return {r * CNN_CLASSES + cls for r in range(CNN_BATCH)}
 
 
 # Function of a sfu_math kernel: k_rsqrt(floatconst*,float*,int) -> rsqrt
@@ -84,6 +117,7 @@ def warp_of_tid(tid):
 
 # Elements a corruption inside the threads of a kernel can change
 def expected_threads(app, rec):
+	app = configure(app)
 	kernel = rec.get("kernel", "")
 	tids = {c["tid"] for c in rec.get("cells", [])} or {rec.get("tid")}
 	wide = rec.get("reg_type") in ("UR", "UP")
@@ -98,7 +132,7 @@ def expected_threads(app, rec):
 		if kernel.startswith("gemm_tc"):
 			return {"output_core.bin": set(), "output_tc.bin": tile_of_cta(rec["cta"])}
 		s = set().union(*[warp_of_tid(t) for t in tids]) if wide else tids
-		return {"output_core.bin": s, "output_tc.bin": set()}
+		return {"output_core.bin": {gemm_core_element(t) for t in s}, "output_tc.bin": set()}
 	s = set().union(*[warp_of_tid(t) for t in tids]) if wide else tids
 	return {"output_ptr.bin": s}
 
@@ -106,6 +140,7 @@ def expected_threads(app, rec):
 # An address model store that lands in valid memory: it also changes what reads the
 # landing word. None = the effect cannot be told from the source (nodes of a list).
 def landing_effect(app, rec):
+	app = configure(app)
 	b, off = rec.get("addr_new_buffer", -1), rec.get("addr_new_offset", 0)
 	if app == "shm_stencil":
 		return {} # another word of the same window: same row as the CTA
@@ -132,6 +167,7 @@ def landing_effect(app, rec):
 
 
 def mem_word_effect(app, buffer, off):
+	app = configure(app)
 	if app == "gemm":
 		i = off // 4
 		if buffer == 0: return {"output_core.bin": gemm_row(i // N_GEMM)}
@@ -144,7 +180,7 @@ def mem_word_effect(app, buffer, off):
 		if buffer == 5: return {"output_tc.bin": gemm_col(e0 % N_GEMM) | gemm_col(e1 % N_GEMM)}
 	if app == "cnn":
 		i = off // 4
-		if buffer in (1, 2): return {"output_logits.bin": set(range(CNN_BATCH ** 2))} # filters: all images
+		if buffer in (1, 2): return {"output_logits.bin": set(range(CNN_BATCH * CNN_CLASSES))} # filters: all images
 		if buffer == 3: return {"output_logits.bin": cnn_col(i // CNN_FLAT)}
 		if buffer == 4: return {"output_logits.bin": cnn_col(i)}
 		if buffer == 9: return {"output_logits.bin": {i}}
@@ -256,7 +292,7 @@ def check_mem(folder, app):
 			if wrong is None:
 				res["no_output"] += 1
 				continue
-			if app == "shm_stencil":
+			if configure(app) == "shm_stencil":
 				cta = r["cta"]
 				allowed = {"output_shm.bin": {cta * N_SHM + c for c in range(N_SHM)}}
 			else:

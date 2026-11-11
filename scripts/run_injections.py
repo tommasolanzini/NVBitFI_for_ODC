@@ -42,6 +42,16 @@ def print_usage():
 
 
 ############################################################################
+# Deadline of a campaign: NVBITFI_STOP_AT (seconds since the epoch). No new run starts
+# after it; the run in progress finishes and is recorded. Exit code STOP_AT_EXIT.
+STOP_AT_EXIT = 3
+
+
+def past_stop_time():
+	t = os.environ.get("NVBITFI_STOP_AT")
+	return bool(t) and time.time() >= float(t)
+
+
 # Print progress every 10 minutes for jobs submitted to the cluster
 ############################################################################
 def print_heart_beat(nj):
@@ -130,6 +140,9 @@ def run_multiple_injections_igid(app, inj_mode, igid, where_to_run):
 				break; # no need to run more jobs
 			if total_jobs in done:
 				continue # already recorded: an interrupted campaign can be resumed
+			if past_stop_time():
+				print("NVBITFI_STOP_AT reached: stopping before run %d, the next launch resumes here" % total_jobs)
+				sys.exit(STOP_AT_EXIT)
 			l = line.strip().split() #Example: _Z24bpnn_adjust_weights_cudaPfiS_iS_S_ 0 1297034 0.877316323856 0.214340876321
 			if len(l) >= 5: 
 				# print (line) 

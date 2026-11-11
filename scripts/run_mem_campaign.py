@@ -58,9 +58,15 @@ def phase_run(app, base, phase, name=None):
 TIMING_RUNS = 10
 
 
+NCU_JSON = p.NVBITFI_HOME + "/logs/scaling-2026-11-10/ncu/ncu.json" # scripts/run_ncu.py
+
+
 def measure_kernel_timing(app, base):
 	binary = p.NVBITFI_HOME + "/tests/kernel_timing/repeat_" + app
 	if not os.path.exists(binary):
+		# large variants have no repeat_<app>: GPU-side durations measured with ncu, no tool
+		if os.path.isfile(NCU_JSON) and app in json.load(open(NCU_JSON))["workloads"]:
+			return mp.kernel_timing_from_ncu(NCU_JSON, app)
 		sys.exit(binary + " not found: run make -C tests/kernel_timing")
 	run_dir = base + "/profile-kernel-timing"
 	shutil.rmtree(run_dir, True)
@@ -222,6 +228,10 @@ def cmd_run(a, base):
 	for line in open(list_path(base, a.mode)):
 		t = json.loads(line)
 		if t["icount"] not in done:
+			stop_at = os.environ.get("NVBITFI_STOP_AT") # deadline, as in run_injections.py
+			if stop_at and time.time() >= float(stop_at):
+				print("NVBITFI_STOP_AT reached: stopping before icount %s, the next launch resumes here" % t["icount"])
+				sys.exit(3)
 			run_target(a, base, t, out)
 
 

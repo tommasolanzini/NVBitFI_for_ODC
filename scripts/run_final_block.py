@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Driver of the final campaign, plan in logs/mem-plan-2026-11-04/PLAN.md.
 #
-#   run_final_block.py <1-5> [--root DIR] [--dry-run] [--smoke N] [--part P] [--gate-dummy 0|1|2]
+#   run_final_block.py <1-6> [--root DIR] [--dry-run] [--smoke N] [--part P] [--gate-dummy 0|1|2] [--stop-at TIME]
 #
 # A block is made of parts. For each part: build with DUMMY=2, run its gate, stop the
 # whole block if a gate run is not Masked; build with DUMMY=0, run its cells. The lists
@@ -13,6 +13,9 @@
 #   --part P        only that part
 #   --gate-dummy D  gate built with DUMMY=D instead of 2 (the same value written back,
 #                   so the write path runs too). 0 = real flips, to see the gate stop
+#   --stop-at TIME  deadline, "YYYY-MM-DD HH:MM:SS" local time: no cell starts after it, and
+#                   the cell in progress stops before its next run (NVBITFI_STOP_AT, the run in
+#                   progress is finished and recorded). Launch the block again to resume.
 #
 # Exit code: 0 done, 2 stopped by a gate or a check. The reason is in <root>/STOPPED.txt.
 
@@ -21,6 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import run_tmp as cf
 
 GATE_DUMMY = 2
+STOP_AT_EXIT = 3 # run_injections.py and run_mem_campaign.py, deadline reached
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 DEFAULT_RUN_ROOT = ROOT + "/logs/final-2026-11-05"
@@ -29,12 +33,16 @@ ARCH = "sm_120"
 G_FP32, G_LD, G_PR, G_UNIFORM, G_GP, G_ADDR, G_ADDR_STORE = 1, 2, 3, 9, 12, 13, 14
 ADJ_BITS, ADJ_REGS, ADJ_LANES = 4, 5, 6
 ALL_APPS = ["gemm", "ptr_chase", "cnn", "shm_stencil", "sfu_math"]
+LARGE_APPS = ["cnn_large", "gemm_n1024", "gemm_n2048"] # block 6
+BINARY = dict({a: "test-apps/%s/%s" % (a, a) for a in ALL_APPS + ["cnn_large"]}, gemm_n1024="test-apps/gemm_large/gemm_n1024", gemm_n2048="test-apps/gemm_large/gemm_n2048")
 PR_APPS = ["gemm", "ptr_chase", "shm_stencil", "sfu_math"]
 
 # Seconds per run, from PLAN.md: only for the estimate of --dry-run
-S_REG = {"gemm": .55, "ptr_chase": .55, "shm_stencil": .55, "sfu_math": .55, "cnn": .57}
+S_REG = {"gemm": .55, "ptr_chase": .55, "shm_stencil": .55, "sfu_math": .55, "cnn": .57,
+	"cnn_large": .8, "gemm_n1024": 6.8, "gemm_n2048": 40.7} # large: smoke run of block 6, 2026-11-11
 S_MEM = {("gemm", "a"): 1.24, ("gemm", "b"): 1.24, ("ptr_chase", "a"): 1.33, ("ptr_chase", "b"): 1.42, ("cnn", "a"): 2.22, ("cnn", "b"): 2.22, ("shm_stencil", "u"): .72, ("shm_stencil", "s"): .72,
-	("shm_stencil", "a"): .74, ("shm_stencil", "b"): .74, ("sfu_math", "a"): 1.76, ("sfu_math", "b"): 1.76} # smoke run 2026-11-10
+	("shm_stencil", "a"): .74, ("shm_stencil", "b"): .74, ("sfu_math", "a"): 1.76, ("sfu_math", "b"): 1.76, # smoke run 2026-11-10
+	("cnn_large", "b"): .95, ("gemm_n1024", "b"): 4.3} # smoke run of block 6, 2026-11-11
 
 MASKED = (1, 2, 3)
 SUSPENDED_S = 0.5
@@ -138,6 +146,14 @@ def blocks():
 		5: [part("single bit on PR and UR, ptr_chase shm_stencil sfu_math", reg_cells(GAP_APPS, G_PR, 100) + reg_cells(GAP_APPS, G_UNIFORM, 100),
 				reg_cells(GAP_APPS, G_PR, 1000) + reg_cells(GAP_APPS, G_UNIFORM, 1000)),
 			part("global memory single bit, shm_stencil sfu_math", mem_cells(GLOBAL_GAPS, 100), mem_cells(GLOBAL_GAPS, 1000))],
+		# Verification of the rates on larger workloads (2026-11-11), one part per workload so
+		# that its gate runs just before its cells: GPR single bit, then global memory mode b.
+		6: [part("cnn_large: GPR and global memory mode b", reg_cells(["cnn_large"], G_GP, 50) + mem_cells([("cnn_large", "b")], 50),
+				reg_cells(["cnn_large"], G_GP, 500) + mem_cells([("cnn_large", "b")], 500)),
+			part("gemm N=1024: GPR and global memory mode b", reg_cells(["gemm_n1024"], G_GP, 50) + mem_cells([("gemm_n1024", "b")], 50),
+				reg_cells(["gemm_n1024"], G_GP, 500) + mem_cells([("gemm_n1024", "b")], 500)),
+			# gate of 20 here: 40 s per run, and the same code as N=1024 passed its gate of 50
+			part("gemm N=2048: GPR", reg_cells(["gemm_n2048"], G_GP, 20), reg_cells(["gemm_n2048"], G_GP, 500))],
 	}
 
 
@@ -215,6 +231,10 @@ class Driver:
 		self.a = a
 		self.root = os.path.abspath(a.root)
 		self.env = dict(os.environ, NVBITFI_HOME=ROOT)
+		stop = getattr(a, "stop_at", None)
+		self.stop_at = time.mktime(time.strptime(stop, "%Y-%m-%d %H:%M:%S")) if stop else None
+		if self.stop_at:
+			self.env["NVBITFI_STOP_AT"] = str(self.stop_at)
 		self.dummy_built = {}
 
 	def log(self, **kw):
@@ -289,8 +309,8 @@ class Driver:
 			if u.startswith("scripts/"):
 				shutil.copy(os.path.join(ROOT, u), d)
 		shutil.copy(ROOT + "/logs/mem-plan-2026-11-04/PLAN.md", "%s/PLAN-%s.md" % (d, stamp))
-		for app in ALL_APPS:
-			self.record_hash("%s/test-apps/%s/%s" % (ROOT, app, app), kind="workload")
+		for app in ALL_APPS + LARGE_APPS:
+			self.record_hash("%s/%s" % (ROOT, BINARY[app]), kind="workload")
 
 	# A folder like NVBITFI_HOME with its own params.py: same scripts, one group and model
 	def make_home(self, home, app, igid, bfm, n):
@@ -335,7 +355,10 @@ class Driver:
 		out = home + "/driver.log"
 		if not glob.glob(logs + "/injection-list/*.txt") and self.sh("cd %s/scripts && python3 generate_injection_list.py" % home, env, out):
 			raise Stop("list of %s failed" % c.name)
-		if self.sh("cd %s/scripts && python3 run_injections.py standalone" % home, env, out):
+		rc = self.sh("cd %s/scripts && python3 run_injections.py standalone" % home, env, out)
+		if rc == STOP_AT_EXIT:
+			self.check_deadline("during " + c.name)
+		if rc:
 			raise Stop("%s failed, see %s" % (c.name, out))
 		files = glob.glob(logs + "/results-*.jsonl")
 		return load_jsonl(files[0]) if files else []
@@ -355,7 +378,10 @@ class Driver:
 			extra += " --step %d" % c.step if c.step else ""
 			cmd += "python3 run_mem_campaign.py list %s %s --mode %s -n %d --seed %d%s && " % (c.app, cell, c.mode, c.n, c.seed(stage), extra)
 		cmd += "python3 run_mem_campaign.py run %s %s --mode %s" % (c.app, cell, c.mode)
-		if self.sh(cmd, self.env, out):
+		rc = self.sh(cmd, self.env, out)
+		if rc == STOP_AT_EXIT:
+			self.check_deadline("during " + c.name)
+		if rc:
 			raise Stop("%s failed, see %s" % (c.name, out))
 		path = "%s/results-mode%s.jsonl" % (cell, c.mode)
 		return load_jsonl(path) if os.path.isfile(path) else []
@@ -363,7 +389,12 @@ class Driver:
 	def tool_dummy(self, stage):
 		return (self.a.gate_dummy if self.a.gate_dummy is not None else GATE_DUMMY) if stage == "dummy1" else 0
 
+	def check_deadline(self, what):
+		if self.stop_at and time.time() >= self.stop_at:
+			raise Stop("deadline %s reached %s; launch the block again to resume" % (self.a.stop_at, what))
+
 	def run_cell(self, c, stage):
+		self.check_deadline("before " + c.name)
 		self.preflight()
 		base = "%s/%s" % (self.root, stage)
 		os.makedirs(base, exist_ok=True)
@@ -442,12 +473,13 @@ def dry_run(block, parts):
 def main():
 	sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 	ap = argparse.ArgumentParser()
-	ap.add_argument("block", type=int, choices=[1, 2, 3, 4, 5])
+	ap.add_argument("block", type=int, choices=[1, 2, 3, 4, 5, 6])
 	ap.add_argument("--root", default=DEFAULT_RUN_ROOT)
 	ap.add_argument("--dry-run", action="store_true")
 	ap.add_argument("--smoke", type=int)
 	ap.add_argument("--part", type=int)
 	ap.add_argument("--gate-dummy", type=int, choices=[0, 1, 2])
+	ap.add_argument("--stop-at")
 	a = ap.parse_args()
 	parts = blocks()[a.block]
 	if a.part is not None:

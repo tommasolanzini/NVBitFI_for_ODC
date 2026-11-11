@@ -321,15 +321,32 @@ def is_timeout(app, pr): # check if the process is active every 'factor' sec for
 	else:
 		return [False, retcode]
 
+def dmesg_time(line):
+	m = re.match(r"\[\s*(\d+\.\d+)\]", line)
+	return float(m.group(1)) if m else None
+
 def get_dmesg_delta(dm_before, dm_after):
 	lines = dm_before.splitlines()
 	if len(lines) == 0: # dmesg not readable or empty
 		return str(dm_after)
 	llb = lines[-1] # last line
 	pos = dm_after.find(llb)
-	if pos < 0: # ring buffer wrapped
+	if pos >= 0:
+		return str(dm_after[pos+len(llb)+1:])
+	# Last line not found (ring buffer wrapped, or the line changed): keep the lines newer
+	# than its timestamp. Returning the whole buffer would attribute old Xids to this run
+	# (happened on 6 runs of block 6, gemm_n2048 icount 227-232).
+	t = dmesg_time(llb)
+	if t is None:
 		return str(dm_after)
-	return str(dm_after[pos+len(llb)+1:])
+	keep, new = [], False
+	for line in dm_after.splitlines():
+		tl = dmesg_time(line)
+		if tl is not None:
+			new = tl > t
+		if new:
+			keep.append(line)
+	return "".join(l + "\n" for l in keep)
 
 ###############################################################################
 # Optional per-app ML features: <workload dir>/signature.py compares the outputs

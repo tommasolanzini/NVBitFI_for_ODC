@@ -285,6 +285,29 @@ apps = {
 			1, # expected runtime
 			"" # additional parameters to the run.sh
 		],
+	# Large variants, block 6 (verification of the rates on larger workloads). The expected
+	# runtime is the measured time of one run under the injector: it sets the timeout (x10).
+	'cnn_large': [
+			NVBITFI_HOME + '/test-apps/cnn_large', # workload directory
+			'cnn_large', # binary name
+			NVBITFI_HOME + '/test-apps/cnn_large/', # path to the binary file
+			1, # expected runtime
+			"" # additional parameters to the run.sh
+		],
+	'gemm_n1024': [
+			NVBITFI_HOME + '/test-apps/gemm_large', # workload directory
+			'gemm_n1024', # binary name
+			NVBITFI_HOME + '/test-apps/gemm_large/', # path to the binary file
+			6, # expected runtime (5.4 s under the injector, 2026-11-11)
+			"gemm_n1024" # run.sh: the binary, also used to find golden-<binary>/
+		],
+	'gemm_n2048': [
+			NVBITFI_HOME + '/test-apps/gemm_large', # workload directory
+			'gemm_n2048', # binary name
+			NVBITFI_HOME + '/test-apps/gemm_large/', # path to the binary file
+			20, # expected runtime (19.5 s under the injector, 2026-11-11)
+			"gemm_n2048" # run.sh: the binary, also used to find golden-<binary>/
+		],
 }
 
 # Groups to inject per app (default: every group in inst_value_igid_bfm_map)
@@ -294,6 +317,9 @@ app_igids = {
 	'cnn': [G_GP, G_UNIFORM, G_FP32, G_LD], # no SFU or Tensor Core instructions; loop control is uniform (UISETP), so no predicate writers
 	'shm_stencil': [], # only for the memory-data injector (mem_injector/)
 	'ptr_chase': [], # only for the memory-data injector (mem_injector/)
+	'cnn_large': [G_GP], # block 6: GPR single bit only
+	'gemm_n1024': [G_GP],
+	'gemm_n2048': [G_GP],
 }
 
 def igids_for_app(app):
