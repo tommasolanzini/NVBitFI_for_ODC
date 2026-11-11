@@ -89,6 +89,17 @@ def kernel_short_name(name):
 	return name.split("(")[0]
 
 
+# Kernel durations on the GPU side (gpu__time_duration, scripts/run_ncu.py), in the format
+# of kernel-timing.json: no launch cost, so no floor to subtract.
+def kernel_timing_from_ncu(ncu_json, workload):
+	kernels = json.load(open(ncu_json))["workloads"][workload]["kernels"]
+	out = {}
+	for k, v in kernels.items():
+		ns = v["time_ns_runs"]
+		out[kernel_short_name(k).split()[-1]] = {"launches": len(ns), "mean_us": sum(ns) / len(ns) / 1000, "min_us": min(ns) / 1000, "max_us": max(ns) / 1000, "source": "ncu gpu__time_duration"}
+	return out
+
+
 # Sets the duration of each kernel event, in ns. t0 and t1 stay as measured, so
 # the gaps do not change.
 def apply_kernel_timing(events, timing):

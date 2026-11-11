@@ -2,7 +2,10 @@
 # Runs a workload under the liveness tool and checks that its output stays the golden
 # one: the tool must not disturb it.
 #
-#   run_liveness.py <app> <output dir>
+#   run_liveness.py <app> <output dir> [golden dir]
+#
+# golden dir: where the golden_output* files are, default the workload directory
+# (test-apps/gemm_large keeps one per size, in golden-<binary>/; GEMM_BIN picks the binary).
 #
 # Writes <output dir>/liveness.jsonl and run.txt. See "Register liveness" in README.md.
 
@@ -25,7 +28,8 @@ def main():
 			rc = subprocess.call([os.path.join(app_dir, "run.sh")], cwd=out, env=env, stdout=so, stderr=se)
 	seconds = time.monotonic() - start
 	same = {}
-	for golden in glob.glob(app_dir + "/golden_output*"):
+	golden_dir = os.path.abspath(sys.argv[3]) if len(sys.argv) > 3 else app_dir
+	for golden in glob.glob(golden_dir + "/golden_output*"):
 		name = os.path.basename(golden)[len("golden_"):]
 		path = os.path.join(out, name)
 		same[name] = os.path.isfile(path) and filecmp.cmp(golden, path, shallow=False)

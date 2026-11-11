@@ -2,7 +2,7 @@
 # runs LAUNCHES times and prints its host-side duration. The workloads themselves
 # keep launching each kernel once. Do not use these binaries for injection.
 ARCH ?= 120
-APPS = ptr_chase shm_stencil gemm cnn
+APPS = ptr_chase shm_stencil gemm cnn sfu_math
 TARGETS = $(APPS:%=repeat_%) empty_kernel
 
 all: $(TARGETS)

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Driver of the final campaign, plan in logs/mem-plan-2026-11-04/PLAN.md.
 #
-#   run_final_block.py <1-4> [--root DIR] [--dry-run] [--smoke N] [--part P] [--gate-dummy 0|1|2]
+#   run_final_block.py <1-5> [--root DIR] [--dry-run] [--smoke N] [--part P] [--gate-dummy 0|1|2]
 #
 # A block is made of parts. For each part: build with DUMMY=2, run its gate, stop the
 # whole block if a gate run is not Masked; build with DUMMY=0, run its cells. The lists
@@ -33,7 +33,8 @@ PR_APPS = ["gemm", "ptr_chase", "shm_stencil", "sfu_math"]
 
 # Seconds per run, from PLAN.md: only for the estimate of --dry-run
 S_REG = {"gemm": .55, "ptr_chase": .55, "shm_stencil": .55, "sfu_math": .55, "cnn": .57}
-S_MEM = {("gemm", "a"): 1.24, ("gemm", "b"): 1.24, ("ptr_chase", "a"): 1.33, ("ptr_chase", "b"): 1.42, ("cnn", "a"): 2.22, ("cnn", "b"): 2.22, ("shm_stencil", "u"): .72, ("shm_stencil", "s"): .72}
+S_MEM = {("gemm", "a"): 1.24, ("gemm", "b"): 1.24, ("ptr_chase", "a"): 1.33, ("ptr_chase", "b"): 1.42, ("cnn", "a"): 2.22, ("cnn", "b"): 2.22, ("shm_stencil", "u"): .72, ("shm_stencil", "s"): .72,
+	("shm_stencil", "a"): .74, ("shm_stencil", "b"): .74, ("sfu_math", "a"): 1.76, ("sfu_math", "b"): 1.76} # smoke run 2026-11-10
 
 MASKED = (1, 2, 3)
 SUSPENDED_S = 0.5
@@ -110,6 +111,8 @@ PTR = [("ptr_chase", "a"), ("ptr_chase", "b")]
 SHM = [("shm_stencil", "u"), ("shm_stencil", "s")]
 CNN = [("cnn", "a"), ("cnn", "b")]
 CNN_GROUPS = [G_FP32, G_LD, G_UNIFORM, G_GP]
+GAP_APPS = ["ptr_chase", "shm_stencil", "sfu_math"]
+GLOBAL_GAPS = [("shm_stencil", "a"), ("shm_stencil", "b"), ("sfu_math", "a"), ("sfu_math", "b")]
 
 
 def part(name, gate, cells):
@@ -130,6 +133,11 @@ def blocks():
 				reg_mcu(ALL_APPS, G_UNIFORM, [ADJ_BITS, ADJ_REGS], 300) + reg_mcu(PR_APPS, G_PR, [ADJ_BITS, ADJ_LANES], 300)),
 			part("MCU in memory, gemm ptr_chase", mem_mcu_gate(GEMM + PTR), mem_mcu(GEMM + PTR, 300))],
 		4: [part("MCU in memory, cnn shm_stencil", mem_mcu_gate(CNN + SHM), mem_mcu(CNN + SHM, 300))],
+		# Gaps of coverage_inputs (2026-11-10). No uniform predicate (UP) is written by these three
+		# workloads, so the uniform group is all UR here. shm_stencil and sfu_math in global memory.
+		5: [part("single bit on PR and UR, ptr_chase shm_stencil sfu_math", reg_cells(GAP_APPS, G_PR, 100) + reg_cells(GAP_APPS, G_UNIFORM, 100),
+				reg_cells(GAP_APPS, G_PR, 1000) + reg_cells(GAP_APPS, G_UNIFORM, 1000)),
+			part("global memory single bit, shm_stencil sfu_math", mem_cells(GLOBAL_GAPS, 100), mem_cells(GLOBAL_GAPS, 1000))],
 	}
 
 
@@ -434,7 +442,7 @@ def dry_run(block, parts):
 def main():
 	sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 	ap = argparse.ArgumentParser()
-	ap.add_argument("block", type=int, choices=[1, 2, 3, 4])
+	ap.add_argument("block", type=int, choices=[1, 2, 3, 4, 5])
 	ap.add_argument("--root", default=DEFAULT_RUN_ROOT)
 	ap.add_argument("--dry-run", action="store_true")
 	ap.add_argument("--smoke", type=int)

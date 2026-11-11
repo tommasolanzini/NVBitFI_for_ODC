@@ -210,7 +210,9 @@ Limits of these durations:
   measurements on the GPU side.
 - **Warm caches.** `k_walk` takes 27 us on its first launch without the tool and 19 us later. How much of
   this is cold caches is not known.
-- `repeat_gemm` covers gemm; sfu_math launches through a macro and has no copy yet.
+- `repeat_gemm` covers gemm. `repeat_sfu_math` covers sfu_math (launches inside a macro, handled by
+  `generate.py` since 2026-11-10): the 5 kernels take 5.59-5.70 us, at or below the empty kernel, so their
+  lower bound is 0. Host times cannot separate them from the launch cost.
 
 Bounds of the time weights (`scripts/mem_time_bounds.py`, no GPU):
 
