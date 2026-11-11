@@ -63,18 +63,42 @@ def run(cmd, cwd, log):
 
 def raw_csv(ncu, rep):
 	out = subprocess.run([ncu, "--import", rep, "--csv", "--page", "raw"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, universal_newlines=True).stdout
-	rows = list(csv.reader(io.StringIO(out)))
+	return parse_csv(out), out
+
+
+# ncu picks the unit per value (us or ms, Kbyte or Gbyte...), given in row 1 of the raw page.
+# Everything is converted to ns and bytes (decimal prefixes, as ncu uses).
+SCALE = {"ns": 1, "us": 1e3, "ms": 1e6, "s": 1e9, "byte": 1, "Kbyte": 1e3, "Mbyte": 1e6, "Gbyte": 1e9, "Tbyte": 1e12}
+
+
+def parse_csv(text):
+	rows = list(csv.reader(io.StringIO(text)))
 	if len(rows) < 2:
-		return [], out
-	head = rows[0]
-	return [dict(zip(head, r)) for r in rows[2:]], out  # row 1: units
+		return []
+	head, units = rows[0], rows[1]
+	return [{h: num(v, u) for h, u, v in zip(head, units, r)} for r in rows[2:]]
 
 
-def num(v):
+def num(v, unit=""):
 	try:
-		return float(v.replace(",", ""))
+		x = float(v.replace(",", ""))
 	except (AttributeError, ValueError):
 		return v
+	return x * SCALE.get(unit, 1)
+
+
+# ncu.json entry of one workload, from the CSVs saved in its dir
+def collect(d, runs):
+	times = {}
+	for i in range(runs):
+		for r in parse_csv(open("%s/time-%d.csv" % (d, i)).read()):
+			times.setdefault(r["Kernel Name"].split("(")[0], []).append(r["gpu__time_duration.sum"])
+	kernels = {}
+	for r in parse_csv(open(d + "/metrics.csv").read()):
+		k = r["Kernel Name"].split("(")[0]
+		kernels[k] = {m: v for m, v in r.items() if "__" in m}
+		kernels[k]["time_ns_runs"] = times.get(k, [])
+	return kernels
 
 
 def give_back(path):
@@ -92,31 +116,35 @@ def main():
 	ap.add_argument("--ncu", default=find_ncu())
 	ap.add_argument("--runs", type=int, default=5)
 	ap.add_argument("--only")
+	ap.add_argument("--reparse", action="store_true", help="rebuild ncu.json from the saved CSVs, no GPU, no root")
 	a = ap.parse_args()
+	out = os.path.abspath(a.out)
+	if a.reparse:
+		result = json.load(open(out + "/ncu.json"))
+		for w in result["workloads"]:
+			result["workloads"][w]["kernels"] = collect(os.path.join(out, w), result["runs"])
+		result["units"] = "ns and bytes"
+		json.dump(result, open(out + "/ncu.json", "w"), indent=1)
+		return
 	if not a.ncu:
 		sys.exit("ncu not found: pass --ncu")
-	out = os.path.abspath(a.out)
 	os.makedirs(out, exist_ok=True)
 	ver = subprocess.run([a.ncu, "--version"], stdout=subprocess.PIPE, universal_newlines=True).stdout.strip().splitlines()[-1]
 	names = a.only.split(",") if a.only else list(WORKLOADS)
 	env = {k: v for k, v in os.environ.items() if k != "LD_PRELOAD"}
-	result = {"ncu": a.ncu, "ncu_version": ver, "runs": a.runs, "metrics": METRICS, "sections": SECTIONS, "workloads": {}}
+	result = {"ncu": a.ncu, "ncu_version": ver, "runs": a.runs, "units": "ns and bytes", "metrics": METRICS, "sections": SECTIONS, "workloads": {}}
 	try:
 		for w in names:
 			d = os.path.join(out, w)
 			os.makedirs(d, exist_ok=True)
 			log = d + "/ncu.log"
 			binary = WORKLOADS[w]
-			times = {}
 			for i in range(a.runs):
 				rep = "%s/time-%d" % (d, i)
 				rc = run([a.ncu, "-f", "-o", rep, "--metrics", "gpu__time_duration.sum", "--cache-control", "none", "--clock-control", "none", binary], d, log)
 				if rc != 0:
 					sys.exit("%s: ncu failed (exit %d), see %s" % (w, rc, log))
-				rows, text = raw_csv(a.ncu, rep + ".ncu-rep")
-				open("%s/time-%d.csv" % (d, i), "w").write(text)
-				for r in rows:
-					times.setdefault(r["Kernel Name"].split("(")[0], []).append(num(r["gpu__time_duration.sum"]))
+				open("%s/time-%d.csv" % (d, i), "w").write(raw_csv(a.ncu, rep + ".ncu-rep")[1])
 			rep = d + "/metrics"
 			cmd = [a.ncu, "-f", "-o", rep, "--replay-mode", "application", "--cache-control", "none", "--clock-control", "none", "--metrics", ",".join(METRICS)]
 			for s in SECTIONS:
@@ -124,13 +152,8 @@ def main():
 			rc = run(cmd + [binary], d, log)
 			if rc != 0:
 				sys.exit("%s: ncu failed (exit %d), see %s" % (w, rc, log))
-			rows, text = raw_csv(a.ncu, rep + ".ncu-rep")
-			open(d + "/metrics.csv", "w").write(text)
-			kernels = {}
-			for r in rows:
-				k = r["Kernel Name"].split("(")[0]
-				kernels[k] = {m: num(v) for m, v in r.items() if "__" in m}
-				kernels[k]["time_ns_runs"] = times.get(k, [])
+			open(d + "/metrics.csv", "w").write(raw_csv(a.ncu, rep + ".ncu-rep")[1])
+			kernels = collect(d, a.runs)
 			result["workloads"][w] = {"binary": os.path.relpath(binary, ROOT), "kernels": kernels}
 			print(w, ", ".join("%s %.2f us" % (k, sum(v["time_ns_runs"]) / len(v["time_ns_runs"]) / 1000) for k, v in kernels.items() if v["time_ns_runs"]), flush=True)
 		json.dump(result, open(out + "/ncu.json", "w"), indent=1)
