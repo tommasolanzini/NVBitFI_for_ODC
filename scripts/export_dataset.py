@@ -5,7 +5,9 @@
 #
 # Writes runs.csv and schema.json (one entry per column; SCHEMA.md is written from it).
 # Sources: logs/final-v1-2026-11-03-gemm (gemm and sfu_math, single bit) and the real runs
-# (dummy0) of logs/final-2026-11-05, blocks 1-5 (block of a cell from run_final_block.py).
+# (dummy0) of logs/final-2026-11-05, blocks 1-6 (block of a cell from run_final_block.py).
+# Workload size and per-kernel GPU features (no tool) come from logs/scaling-2026-11-10:
+# ncu/ncu.json (scripts/run_ncu.py) and scaling.json, else from the memory profiles.
 # Gate runs (DUMMY, no flip) and pilots are not included. Rows are never dropped: runs not
 # valid for the rates carry valid_for_rates = 0 and the reason.
 
@@ -22,6 +24,16 @@ LOGS = ROOT + "/logs"
 FINAL = LOGS + "/final-2026-11-05"
 V1 = LOGS + "/final-v1-2026-11-03-gemm"
 LIVE = LOGS + "/liveness-2026-11-07"
+SCALING = LOGS + "/scaling-2026-11-10"
+LIVE_LARGE = SCALING + "/liveness"
+NCU = SCALING + "/ncu/ncu.json"
+RF_REGS_PER_SM = 65536
+L2_BYTES = 32 * 1024 * 1024
+
+# workload -> (base workload, size parameter, size)
+SIZES = {"gemm": ("gemm", "N", 128), "gemm_n1024": ("gemm", "N", 1024), "gemm_n2048": ("gemm", "N", 2048),
+	"cnn": ("cnn", "batch", 32), "cnn_large": ("cnn", "batch", 256), "ptr_chase": ("ptr_chase", "lists", 4096),
+	"shm_stencil": ("shm_stencil", "N", 128), "sfu_math": ("sfu_math", "N", 128)}
 
 MEM_MODELS = {"adj_bits": "adj_bits", "adj_words": "adj_words"}
 REG_MODELS = {"FLIP_SINGLE_BIT": "single_bit", "MCU_ADJ_BITS": "adj_bits", "MCU_ADJ_REGS": "adj_regs", "MCU_ADJ_LANES": "adj_lanes"}
@@ -30,6 +42,8 @@ SUSPENDED_S = 0.5
 # Location exceptions checked one by one (ANOMALIES-2026-11-07.md, SUMMARY-block5.md): proven
 # moved stores, except these three, consistent but with the landing outside the known buffers
 INFERRED = {("reg-sfu_math-igid12-bfm63", 24), ("reg-ptr_chase-igid12-bfm54", 97), ("reg-cnn-igid12-bfm42", 22)}
+# Block 6 (SUMMARY-block6.md): both exceptions proven moved stores
+PROVEN = {("reg-cnn_large-igid12-bfm0", 289), ("reg-gemm_n1024-igid12-bfm0", 15)}
 
 
 def proven_population(block, igid, bfm):
@@ -45,11 +59,21 @@ def proven_population(block, igid, bfm):
 # ---- columns: name -> description, in order
 COLUMNS = [
 	("run_id", "campaign/cell/icount, unique"),
-	("campaign", "final-v1 (2026-11-03, gemm and sfu_math, code 937a7f8) or final-block1..5 (logs/final-2026-11-05)"),
+	("campaign", "final-v1 (2026-11-03, gemm and sfu_math, code 937a7f8) or final-block1..6 (logs/final-2026-11-05)"),
 	("cell", "folder of the cell: injector, workload, group or mode, fault model"),
 	("icount", "run number inside the cell"),
 	("seed", "seed of the injection list (memory cells); empty for registers (op_seed/bit_seed instead)"),
-	("app", "workload: gemm, cnn, ptr_chase, shm_stencil, sfu_math"),
+	("app", "workload binary: gemm, cnn, ptr_chase, shm_stencil, sfu_math, and the large variants of block 6: gemm_n1024, gemm_n2048, cnn_large"),
+	("workload", "base workload (same code, different size): gemm, cnn, ptr_chase, shm_stencil, sfu_math"),
+	("size_param", "what size counts: N (gemm: matrix side; shm_stencil, sfu_math: elements per row/array), batch (cnn: images), lists (ptr_chase)"),
+	("size", "value of size_param"),
+	("working_set_bytes", "peak live global memory of the run, bytes (allocation profile, no tool)"),
+	("working_set_l2_share", "working_set_bytes / 32 MB L2, capped at 1"),
+	("kernel_gpu_us", "GPU duration of the kernel of the row, no tool (ncu gpu__time_duration, mean of 5 runs); empty for memory mode a (flip between kernels, no kernel) and the other kernel_* too"),
+	("kernel_warps_per_sm", "active warps per SM of that kernel, no tool (ncu sm__warps_active.avg.per_cycle_active)"),
+	("kernel_rf_share", "share of the 64K registers of an SM held by those warps: warps x 32 x registers allocated per thread (ncu launch__registers_per_thread) / 65536"),
+	("kernel_l1_hit_pct", "L1 hit rate of that kernel (ncu l1tex__t_sector_hit_rate)"),
+	("kernel_l2_hit_pct", "L2 hit rate of that kernel (ncu lts__t_sector_hit_rate; can exceed 100, counter quirk)"),
 	("kernel", "kernel of the target, short name; memory mode a: the kernel before which the word is flipped is not a target, see flip_kernel"),
 	("kernel_index", "launch index of that kernel in the run (registers: kcount; memory: flip_kernel)"),
 	("injector", "reg (NVBitFI register injector) or mem (mem_injector, data where it is stored)"),
@@ -113,7 +137,7 @@ COLUMNS = [
 	("runtime_s", "wall time of the run"),
 	("suspended_s", "seconds the machine was suspended during the run"),
 	("valid_for_rates", "1 if the run enters the rates"),
-	("flags", "';' list: not_injected, suspended, v1_up_invalid (R5 zeroed by the NVBit UP write), v1_r1_counted_masked, r1_not_written (R1 among the cells, not written by design), cells_short, mode_s_dataset_only, gemm_pr_loop_control"),
+	("flags", "';' list: not_injected, suspended, v1_up_invalid (R5 zeroed by the NVBit UP write), v1_r1_counted_masked, r1_not_written (R1 among the cells, not written by design), cells_short, mode_s_dataset_only, gemm_pr_loop_control, stale_dmesg (whole old dmesg buffer recorded: xids dropped, Pot DUE with exit 0 counted as SDC)"),
 ]
 
 
@@ -143,6 +167,8 @@ LIVE_TABLES = {}
 def live_weight(app, r):
 	if app not in LIVE_TABLES:
 		p = "%s/%s/liveness.jsonl" % (LIVE, app)
+		if not os.path.isfile(p):
+			p = "%s/%s/liveness.jsonl" % (LIVE_LARGE, app)
 		LIVE_TABLES[app] = lr.site_table(lr.load(p)) if os.path.isfile(p) else None
 	t = LIVE_TABLES[app]
 	if t is None or r.get("reg_type") not in lr.BITS:
@@ -176,6 +202,8 @@ def location(app, r, run_dir, block, name, igid, bfm):
 			allowed = cfl.merge(allowed, cfl.landing_effect(app, r))
 	if cfl.inside(wrong, allowed):
 		out["location_status"] = "expected_with_landing" if landing else "expected"
+	elif (name, r["icount"]) in PROVEN:
+		out["location_status"] = "outside_proven_moved_store"
 	elif (name, r["icount"]) in INFERRED:
 		out["location_status"] = "outside_inferred_moved_store"
 	elif r["injector"] == "reg" and proven_population(block, igid, bfm):
@@ -210,9 +238,74 @@ def is_descriptor(r):
 	return r.get("opcode") == "LDCU" and r.get("reg_type") == "UR" and (short(r.get("kernel")), r.get("pc")) in descriptor_sites(r["app"])
 
 
+NCU_DATA = {}
+WS = {}
+
+
+def peak_live(events):
+	live, peak, size = 0, 0, {}
+	for e in events:
+		if e["kind"] == "alloc":
+			size[e["id"]] = e["size"]
+			live += e["size"]
+			peak = max(peak, live)
+		elif e["kind"] == "free" and e.get("id") in size:
+			live -= size.pop(e["id"])
+	return peak
+
+
+def working_set(app):
+	if app not in WS:
+		ws = None
+		p = SCALING + "/scaling.json"
+		if os.path.isfile(p):
+			t = json.load(open(p))["totals"].get(app)
+			ws = t and t["bytes_peak_live"]
+		if ws is None:
+			profs = glob.glob("%s/profiles/mem-%s/mem-profile.json" % (FINAL, app)) + glob.glob("%s/dummy0/mem-%s-*/mem-profile.json" % (FINAL, app))
+			ws = peak_live(json.load(open(profs[0]))) if profs else None
+		WS[app] = ws
+	return WS[app]
+
+
+def features(app, kernel):
+	base, param, size = SIZES.get(app, (app, "", ""))
+	ws = working_set(app)
+	d = {"workload": base, "size_param": param, "size": size, "working_set_bytes": ws if ws is not None else "",
+		"working_set_l2_share": "%.4g" % min(ws / L2_BYTES, 1.0) if ws else ""}
+	if not NCU_DATA and os.path.isfile(NCU):
+		NCU_DATA.update(json.load(open(NCU))["workloads"])
+	k = NCU_DATA.get(app, {}).get("kernels", {}).get(kernel)
+	if k:
+		t = k["time_ns_runs"]
+		t = sum(t) / len(t) if isinstance(t, list) else t
+		w = k["sm__warps_active.avg.per_cycle_active"]
+		d.update({"kernel_gpu_us": "%.4g" % (t / 1e3), "kernel_warps_per_sm": "%.4g" % w,
+			"kernel_rf_share": "%.4g" % (w * 32 * k["launch__registers_per_thread"] / RF_REGS_PER_SM),
+			"kernel_l1_hit_pct": "%.4g" % k["l1tex__t_sector_hit_rate.pct"], "kernel_l2_hit_pct": "%.4g" % k["lts__t_sector_hit_rate.pct"]})
+	return d
+
+
+# Old get_dmesg_delta returned the whole buffer when the last line was not found
+# (block 6, gemm_n2048 icount 227-232): a delta spanning more than a minute.
+def stale_dmesg(r):
+	ts = [float(x) for x in re.findall(r"\[\s*(\d+\.\d+)\]", str(r.get("dmesg") or ""))]
+	return len(ts) > 1 and ts[-1] - ts[0] > 60
+
+
+def fix_stale(r, flags):
+	if not stale_dmesg(r):
+		return
+	flags.append("stale_dmesg")
+	r["xids"] = []
+	if r["outcome"] == 13 and r.get("exit_code") == 0:  # Pot DUE: output different, but dmesg recorded
+		r["outcome"], r["outcome_str"] = 17, "SDC: Output file is different (reclassified: stale dmesg)"
+
+
 def row_reg(r, campaign, block, name, run_dir):
 	app = r["app"]
 	flags = []
+	fix_stale(r, flags)
 	oc = cat(r["outcome"])
 	ocr = oc
 	valid = bool(r.get("injected", True)) and oc != "other"
@@ -245,6 +338,7 @@ def row_reg(r, campaign, block, name, run_dir):
 		"addr_bit": r.get("addr_bit"), "store_wrong_location": int(r["store_wrong_location"]) if r.get("store_wrong_location") is not None else "",
 		"addr_new_buffer": r.get("addr_new_buffer"), "addr_new_offset": r.get("addr_new_offset"), "memory_descriptor": int(is_descriptor(r)),
 		"liveness_weight": live_weight(app, r)}
+	d.update(features(app, d["kernel"]))
 	d.update(common(r, campaign, name, oc, ocr, valid, flags))
 	if r.get("injected", True) and os.path.isdir(run_dir):
 		d.update(location(app, r, run_dir, block, name, r["igid"], r.get("bfm", 0)))
@@ -256,6 +350,7 @@ def row_reg(r, campaign, block, name, run_dir):
 def row_mem(r, campaign, block, name, run_dir, model, k, step):
 	app = r["app"]
 	flags = []
+	fix_stale(r, flags)
 	oc = cat(r["outcome"])
 	valid = bool(r.get("injected")) and oc != "other"
 	if not r.get("injected"):
@@ -275,6 +370,7 @@ def row_mem(r, campaign, block, name, run_dir, model, k, step):
 		"buffer": r.get("buffer"), "buffer_size": r.get("buffer_size"), "offset": r.get("offset"), "bit": r.get("bit"), "old_word": r.get("old_word"), "new_word": r.get("new_word"),
 		"residents": r.get("residents", ""), "masked_subclass": r.get("masked_subclass") or "", "reads_old": r.get("reads_old"), "reads_new": r.get("reads_new"),
 		"writes_after": r.get("writes_after"), "read_kernels": ";".join(str(x) for x in r.get("read_kernels") or []), "memory_descriptor": 0}
+	d.update(features(app, d["kernel"]))
 	d.update(common(r, campaign, name, oc, oc, valid, flags))
 	if r.get("injected") and os.path.isdir(run_dir):
 		d.update(location(app, r, run_dir, block, name, None, None))
@@ -359,7 +455,8 @@ NOTES = [
 	"memory_descriptor = 1 rows: Masked means output unchanged (tests/desc_probe/README.md).",
 	"gemm PR rows (gemm_pr_loop_control) are loop-control predicates of gemm_core only, as are most PR rows of the other workloads.",
 	"liveness_weight: relative weight of the run if the population is resampled on bit x time; normalise within a population. Empty for address groups (no destination register).",
-	"Location: recomputed from the output files with scripts/check_fault_locations.py; the outside_* labels come from ANOMALIES-2026-11-07.md and SUMMARY-block5.md.",
+	"Location: recomputed from the output files with scripts/check_fault_locations.py; the outside_* labels come from ANOMALIES-2026-11-07.md, SUMMARY-block5.md and SUMMARY-block6.md.",
+	"Workload size (block 6): gemm_n1024/gemm_n2048/cnn_large are gemm/cnn at a larger size (`workload`, `size`). Rates of global memory mode b depend on the size (SUMMARY-block6.md): do not pool sizes for that rate. kernel_* features are measured without a tool (ncu) and are the same for every run of a kernel.",
 ]
 
 
