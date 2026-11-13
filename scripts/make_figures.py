@@ -218,6 +218,48 @@ def fig_rf(cov, out):
     save(fig, out, "fig_res_rf_share")
 
 
+# --- Figure 7: do the rates transfer to larger workloads? (block 6) --------------
+def wilson(k, n, z=1.96):
+    p = k / n; d = 1 + z * z / n
+    c = (p + z * z / (2 * n)) / d; h = z * np.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / d
+    return c - h, c + h
+
+
+def fig_scaling(df, out):
+    def cell(app, kind):
+        if kind == "gp":
+            s = df[(df["app"] == app) & (df["injector"] == "reg") & (df["group"] == "gp") &
+                   (df["fault_model"] == "single_bit")]
+        else:
+            s = df[(df["app"] == app) & (df["injector"] == "mem") & (df["mem_mode"] == "b") &
+                   (df["fault_model"] == "single_bit")]
+        return s
+    rows = [("GPR (gp)", "SDC", "sdc", [("gemm", "gemm_n1024", "gemm N=1024"), ("gemm", "gemm_n2048", "gemm N=2048"),
+                                        ("cnn", "cnn_large", "cnn batch 256")], "gp"),
+            ("GPR (gp)", "Crash", "crash", [("gemm", "gemm_n1024", "gemm N=1024"), ("gemm", "gemm_n2048", "gemm N=2048"),
+                                            ("cnn", "cnn_large", "cnn batch 256")], "gp"),
+            ("Memory, mode b", "SDC", "sdc", [("gemm", "gemm_n1024", "gemm N=1024"),
+                                                     ("cnn", "cnn_large", "cnn batch 256")], "b")]
+    fig, axes = plt.subplots(1, 3, figsize=(WIDTH, 2.4), sharey=True,
+                             gridspec_kw={"width_ratios": [3, 3, 2]})
+    for ax, (title, oname, okey, pairs, kind) in zip(axes, rows):
+        for i, (small, large, lab) in enumerate(pairs):
+            for off, app, col, name in [(-0.12, small, C_CRASH, "small reference (N=128 / batch 32)"),
+                                        (0.12, large, C_SDC, "large variant")]:
+                s = cell(app, kind); n = len(s); k = (s["oc"] == okey).sum()
+                lo, hi = wilson(k, n)
+                ax.errorbar(i + off, k / n * 100, yerr=[[k / n * 100 - lo * 100], [hi * 100 - k / n * 100]],
+                            fmt="o", color=col, ms=6, capsize=2.5, lw=1.4, markeredgecolor="white",
+                            markeredgewidth=0.8, label=name if i == 0 else None)
+        ax.set_xticks(range(len(pairs))); ax.set_xticklabels([p[2] for p in pairs], rotation=20, ha="right")
+        ax.set_title(f"{title}: {oname}", fontsize=8.5)
+        ax.set_xlim(-0.5, len(pairs) - 0.5); ax.set_ylim(0, 100)
+        ax.yaxis.grid(True, color=GRID, lw=0.6); ax.set_axisbelow(True)
+    axes[0].set_ylabel("Share of runs (%)")
+    axes[0].legend(ncol=2, loc="lower left", bbox_to_anchor=(0.0, 1.13), frameon=False)
+    save(fig, out, "fig_res_scaling")
+
+
 if __name__ == "__main__":
     runs, covp, out = sys.argv[1:4]
     os.makedirs(out, exist_ok=True)
@@ -229,6 +271,7 @@ if __name__ == "__main__":
     fig_mcu(df, out)
     fig_addr(df, out)
     fig_rf(cov, out)
+    fig_scaling(df, out)
     t1.round(3).to_csv(os.path.join(out, "check_registers.csv"))
     t2.round(3).to_csv(os.path.join(out, "check_memory.csv"))
     print(t1.round(3).to_string()); print(t2.round(3).to_string())
