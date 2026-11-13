@@ -71,7 +71,8 @@ COLUMNS = [
 	("working_set_l2_share", "working_set_bytes / 32 MB L2, capped at 1"),
 	("kernel_gpu_us", "GPU duration of the kernel of the row, no tool (ncu gpu__time_duration, mean of 5 runs); empty for memory mode a (flip between kernels, no kernel) and the other kernel_* too"),
 	("kernel_warps_per_sm", "active warps per SM of that kernel, no tool (ncu sm__warps_active.avg.per_cycle_active)"),
-	("kernel_rf_share", "share of the 64K registers of an SM held by those warps: warps x 32 x registers allocated per thread (ncu launch__registers_per_thread) / 65536"),
+	("kernel_rf_share", "allocated share of the register file: active warps per SM x 32 x registers allocated per thread (ncu launch__registers_per_thread, hardware granularity, max(16, REGCOUNT)) / 65536"),
+	("kernel_rf_live_share", "live share of the register file: live GPRs per thread (liveness tool: registers used x live fraction) x 32 x active warps per SM / 65536; independent of the allocation; same value as rf_allocation.md, coverage_inputs and SCALING.md"),
 	("kernel_l1_hit_pct", "L1 hit rate of that kernel (ncu l1tex__t_sector_hit_rate)"),
 	("kernel_l2_hit_pct", "L2 hit rate of that kernel (ncu lts__t_sector_hit_rate; can exceed 100, counter quirk)"),
 	("kernel", "kernel of the target, short name; memory mode a: the kernel before which the word is flipped is not a target, see flip_kernel"),
@@ -240,6 +241,26 @@ def is_descriptor(r):
 
 NCU_DATA = {}
 WS = {}
+LIVE_GPR = {}
+
+
+# live GPRs per thread per kernel (mean over the dynamic thread instructions), from the
+# same liveness runs as the liveness weights
+def live_gpr_per_thread(app):
+	if app not in LIVE_GPR:
+		out = {}
+		for d in (LIVE, LIVE_LARGE):
+			p = "%s/%s/liveness.jsonl" % (d, app)
+			if os.path.isfile(p):
+				agg = {}
+				for rec in lr.load(p):
+					a = agg.setdefault(short(rec["kernel"]), [0, 0])
+					a[0] += sum(s["live"] for s in rec["sites"] if lr.class_name(s) == "GPR")
+					a[1] += rec["thread_instrs"]
+				out = {k: v[0] / v[1] for k, v in agg.items() if v[1]}
+				break
+		LIVE_GPR[app] = out
+	return LIVE_GPR[app]
 
 
 def peak_live(events):
@@ -283,6 +304,9 @@ def features(app, kernel):
 		d.update({"kernel_gpu_us": "%.4g" % (t / 1e3), "kernel_warps_per_sm": "%.4g" % w,
 			"kernel_rf_share": "%.4g" % (w * 32 * k["launch__registers_per_thread"] / RF_REGS_PER_SM),
 			"kernel_l1_hit_pct": "%.4g" % k["l1tex__t_sector_hit_rate.pct"], "kernel_l2_hit_pct": "%.4g" % k["lts__t_sector_hit_rate.pct"]})
+		lg = live_gpr_per_thread(app).get(kernel)
+		if lg is not None:
+			d["kernel_rf_live_share"] = "%.4g" % (lg * 32 * w / RF_REGS_PER_SM)
 	return d
 
 
