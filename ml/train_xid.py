@@ -3,6 +3,8 @@
 # seed and parameters of ml/train_gbdt.py.
 #
 #   ~/thesis/venv-ml/bin/python ml/train_xid.py [date]  -> ml/reports/xid-features-<date>.json
+#                                                       and ml/reports/oof_Axid.parquet
+# A+xid and B2+xid are the reference variants from 2026-11-25.
 
 import datetime, json, os, sys
 import numpy as np
@@ -16,7 +18,7 @@ import xid_features as XF  # noqa: E402
 
 FOCUS = ["int", "ld_const", "ld_data", "addr", "move", "mem_global", "ur"]
 DIST = ["f_xid13_oor", "f_xid13_misaligned", "f_xid13_invalid_space", "f_xid13_illegal_param", "f_xid13_other",
-	"f_xid13_n_sm", "f_xid31_read", "f_xid31_write", "f_xid31_low23_in_buf", "f_xid31_bit_to_buf",
+	"f_xid31_read", "f_xid31_write", "f_xid31_end_of_block", "f_xid31_low23_in_buf", "f_xid31_bit_to_buf",
 	"f_xid31_hamming_min", "f_xid31_above_2_47"]
 
 
@@ -52,8 +54,12 @@ def main():
 			pred[cm & (tr.meta_workload == w).to_numpy()], classes) for w in sorted(tr.meta_workload.unique())}
 		nptr = cm & (tr.meta_workload != "ptr_chase").to_numpy()
 		res["crash_without_ptr_chase"] = T.metrics(tr.label[nptr].to_numpy(), pred[nptr], classes)
-		if v.endswith("+xid"):
-			tr["oof_" + v] = pred
+		if v == "A+xid":
+			oof = tr[[c for c in tr.columns if c.startswith("meta_")] + ["label", "f_out_sdc"]].copy()
+			oof["fold"] = fold
+			for i, c in enumerate(classes):
+				oof["p_" + c] = p[:, i]
+			oof.to_parquet(os.path.join(T.REPORTS, "oof_Axid.parquet"), index=False)
 		R["variants"][v] = res
 		print(v, {s: round(m["macro_f1"], 3) for s, m in res["subsets"].items()}, flush=True)
 	# SDC predictions must not change: the new features are NaN on every SDC
@@ -79,9 +85,6 @@ def main():
 			e[f] = float(col.mean()) if len(col) else None
 		ks = x.f_xid31_k.dropna().astype(int)
 		e["k_hist"] = {int(a): int(b) for a, b in ks.value_counts().sort_index().items()}
-		e["k_rel_hist"] = {int(a): int(b) for a, b in x.f_xid31_k_rel.dropna().astype(int).value_counts().sort_index().items()}
-		e["k_ptr_only"] = float(x.f_xid31_k_ptr_only.dropna().mean()) if x.f_xid31_k_ptr_only.notna().any() else None
-		e["k_ambiguous"] = float(x.f_xid31_k_ambiguous.dropna().mean()) if x.f_xid31_k_ambiguous.notna().any() else None
 		dist[c] = e
 	R["distribution"] = dist
 	R["coverage_by_app"] = {a: {"crash": int(len(g)), "addr_test": int(g.f_xid31_low23_in_buf.notna().sum()), "xid31_addr": int(g.f_xid31_read.notna().sum())}

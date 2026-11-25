@@ -294,6 +294,38 @@ Chance levels outside ptr_chase: (a') 0.02-0.04, (b') 0.10-0.19.
 
 ## Open points
 
-- Flag "fault at the end of a 4 MiB chunk" in place of k = 22 (see above).
+- Flag "fault at the end of a 4 MiB chunk" in place of k = 22: done, see the revision below.
 - The output-signature NaN pattern acts as a kernel marker on crashes in variant A. It is
   part of A by design; B2 removes the explicit markers but not this pattern.
+
+## Revision 2026-11-25 (after review): end-of-block flag
+
+Decided after review: k = 22 replaced by `f_xid31_end_of_block`, the constant features removed
+(`f_xid31_k_rel`, `f_xid31_k_misaligned`, `f_xid31_k_ptr_only`, `f_xid31_k_ambiguous`,
+`f_xid13_n_sm`). A+xid and B2+xid are the reference variants from now on.
+
+Definition: the known buffers of a workload sit in a mapped block of 4 MiB granules; the flag is 1
+when the faulting page has low 23 bits = end of the known buffers rounded up to 4 MiB (0x400000 for
+gemm, cnn, shm_stencil, sfu_math; 0x0 for ptr_chase and cnn_large, whose buffers pass 4 MiB) and the
+address is at least 8 MiB (address 0 is a null pointer, not the end of the block). When the flag is 1,
+(b') and k are NaN (not a flip). NaN where the address test is not available (gemm_n1024, gemm_n2048).
+
+Rebuilt dataset: 62 f_ + 6 fw_ columns. Same folds and seed; results in `xid-features-2026-11-25-eob.json`;
+the out-of-fold probabilities of A+xid are saved in `oof_Axid.parquet` (input of ml/quantify.py).
+
+| Variant | Crash macro-F1 / acc | Crash without ptr_chase | SDC macro-F1 |
+|---|---|---|---|
+| A+xid (k = 22) | 0.276 / 0.445 | 0.314 / 0.489 | 0.371 |
+| A+xid (end of block) | 0.269 / 0.443 | 0.307 / 0.484 | 0.372 |
+| B2+xid (k = 22) | 0.195 / 0.367 | 0.277 / 0.445 | 0.363 |
+| B2+xid (end of block) | 0.201 / 0.376 | 0.285 / 0.446 | 0.369 |
+
+Share of crashes with the flag set, per true class (rows with the address test):
+
+| Class | addr | int | ld_const | ld_data | mem_global | move | pr | up | ur |
+|---|---|---|---|---|---|---|---|---|---|
+| end of block | 0.02 | 0.05 | 0.01 | 0.00 | 0.01 | 0.03 | 0.66 | 0.92 | 0.16 |
+
+The flag carries what k = 22 carried (pr 0.66, up 0.92, ur 0.16) and removes it from the flip
+histogram; A+xid crash moves by -0.007 and B2+xid by +0.006 (noise level, same information).
+SDC predictions that differ between A and A+xid: 764, between B2 and B2+xid: 847 (of 17572); macro-F1 within 0.006.

@@ -4,15 +4,18 @@
 # the golden allocation profile of the workload. Never the injection record.
 #
 # What the messages contain on this GPU (driver 580, RTX PRO 1000 Blackwell):
-#   Xid 13: SM warp exception type and (GPC, TPC, SM); no data address (the ESR words
+#   Xid 13: SM warp exception type; no data address (the ESR words
 #           that look like one are the same constant in every run and every binary).
 #   Xid 31: MMU fault with the faulting address at 4 KiB page granularity (bits 0-11
 #           lost) and the access type (read/write; no atomic observed).
 # Buffer bases change between processes in bits >= 23; the low 23 bits (offset inside an
 # 8 MiB region) are stable. Only buffers copied host<->device have a known address in the
 # golden profile (mem-profile.json has no base for alloc events).
+# The buffers sit in a mapped block of 4 MiB granules; a fault on the first page after the
+# block (low 23 bits = end of the known buffers rounded up to 4 MiB) is a sequential access
+# running off the mapping, not a bit flip of a pointer: f_xid31_end_of_block, and no k.
 
-import glob, json, math, os, re
+import glob, json, os, re
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -25,13 +28,13 @@ LOW_MASK = (1 << LOW) - 1
 PAGE = 12
 K_RANGE = range(PAGE, LOW)  # bits observable and stable: 12..22
 PAGE_BITS = LOW_MASK & ~((1 << PAGE) - 1)
+CHUNK = 22  # mapping granule: 4 MiB
 
 XID13_TYPES = {"Out Of Range Address": "oor", "Misaligned Address": "misaligned",
 	"Invalid Address Space": "invalid_space", "Illegal Instruction Parameter": "illegal_param"}
 XID13_CATS = ["oor", "misaligned", "invalid_space", "illegal_param", "other"]
 
 RE_XID = re.compile(r"Xid \([^)]*\)[:-] (\d+),")
-RE_SM = re.compile(r"SM (?:Warp|Global) Exception on \(GPC (\d+), TPC (\d+), SM (\d+)\)")
 RE_WARP = re.compile(r"SM Warp Exception on \([^)]*\)[:-] ([A-Za-z ]+)")
 RE_FAULT = re.compile(r"faulted @ 0x([0-9a-f_]+)\. Fault is of type \S+ ACCESS_TYPE_VIRT_(\w+)")
 
@@ -40,15 +43,15 @@ RE_FAULT = re.compile(r"faulted @ 0x([0-9a-f_]+)\. Fault is of type \S+ ACCESS_T
 # nodes 16-byte structs; everything else fp32.
 ELEM = {("gemm", 32768): 2, ("gemm", 2097152): 2, ("ptr_chase", 32768): 8, ("ptr_chase", 4194304): 16}
 
-FEATURES = (["f_xid13_" + c for c in XID13_CATS] + ["f_xid13_n_sm",
-	"f_xid31_read", "f_xid31_write", "f_xid31_low23_in_buf", "f_xid31_bit_to_buf", "f_xid31_k",
-	"f_xid31_k_rel", "f_xid31_k_misaligned", "f_xid31_k_ptr_only", "f_xid31_k_ambiguous",
+FEATURES = (["f_xid13_" + c for c in XID13_CATS] + ["f_xid31_read", "f_xid31_write",
+	"f_xid31_end_of_block", "f_xid31_low23_in_buf", "f_xid31_bit_to_buf", "f_xid31_k",
 	"f_xid31_hamming_min", "f_xid31_above_2_47"])
 
 
 def _profile(app):
-	"""[(low 23 bits of base, size, element size)] of the buffers with a known address, or None
-	(no profile, or the known buffers do not fit in one 8 MiB region)."""
+	"""([(low 23 bits of base, size, element size)] of the buffers with a known address, pages
+	they cover, low 23 bits of the first page after the mapped block), or None (no profile, or
+	the known buffers do not fit in one 8 MiB region)."""
 	fs = glob.glob(os.path.join(FINAL, "profiles/mem-%s/mem-profile.json" % app))
 	if not fs:
 		return None
@@ -61,7 +64,9 @@ def _profile(app):
 	if sum(s for _, s, _ in bufs) > (1 << LOW) or any(o + s > (1 << LOW) for o, s, _ in bufs):
 		return None
 	pages = np.unique(np.concatenate([np.arange(o >> PAGE, (o + s - 1 >> PAGE) + 1) << PAGE for o, s, _ in bufs]))
-	return bufs, pages
+	end = max(o + s for o, s, _ in bufs)
+	eob = (((end - 1) >> CHUNK) + 1 << CHUNK) & LOW_MASK
+	return bufs, pages, eob
 
 
 _PROFILES = {}
@@ -85,21 +90,19 @@ def address_features(app, addr):
 	prof = profile(app)
 	if prof is None:
 		return f
-	bufs, pages = prof
+	bufs, pages, eob = prof
 	page = addr & PAGE_BITS
 	inside = _buffer_of(page, bufs) is not None
 	f["f_xid31_low23_in_buf"] = int(inside)
 	f["f_xid31_hamming_min"] = int(np.bitwise_count((pages ^ page) & PAGE_BITS).min())
-	if inside:
-		return f  # (b'), k: not applicable, the stable bits already fall in a buffer
+	# addr >= 8 MiB: a null pointer (address 0) is not the end of the block
+	f["f_xid31_end_of_block"] = int(page == eob and addr >= 1 << LOW)
+	if inside or f["f_xid31_end_of_block"]:
+		return f  # (b'), k: not applicable (stable bits in a buffer, or not a flip)
 	for k in K_RANGE:
-		b = _buffer_of(page ^ (1 << k), bufs)
-		if b is not None:
-			rel = k - int(math.log2(b[2]))
-			f.update({"f_xid31_bit_to_buf": 1, "f_xid31_k": k, "f_xid31_k_rel": rel,
-				# page granularity: k >= 12, so a misaligned flip (k < log2 element) is never visible
-				"f_xid31_k_misaligned": np.nan, "f_xid31_k_ptr_only": int(k > 31 + math.log2(b[2])),
-				"f_xid31_k_ambiguous": int(not k > 31 + math.log2(b[2]))})
+		if _buffer_of(page ^ (1 << k), bufs) is not None:
+			# page granularity: k >= 12, so k_rel / misaligned / pointer-only flags are constant
+			f.update({"f_xid31_bit_to_buf": 1, "f_xid31_k": k})
 			return f
 	f["f_xid31_bit_to_buf"] = 0
 	return f
@@ -116,7 +119,6 @@ def features(app, dmesg):
 			types = {"other"}
 		for c in XID13_CATS:
 			f["f_xid13_" + c] = int(c in types)
-		f["f_xid13_n_sm"] = len({m.groups() for l in xid13 for m in RE_SM.finditer(l)})
 	faults = [m for l in lines for m in RE_FAULT.finditer(l)]
 	if faults:
 		acc = {m.group(2) for m in faults}
