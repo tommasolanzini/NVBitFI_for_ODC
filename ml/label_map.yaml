@@ -1,0 +1,107 @@
+# Stage 1 targets: "manifestation class" of a fault. Its meaning depends on the target:
+#   - GPR destination: the functional unit that produced the value, from the opcode
+#     (unit output, pipeline latches and the register-file cell just written are
+#     architecturally indistinguishable);
+#   - PR / UR / UP: the register class, whatever the opcode;
+#   - addr: the address path at the moment of use (AGU and latches towards the LSU),
+#     memory descriptor included;
+#   - mem_global / mem_shared: the memory structure.
+# The LDCU of the memory descriptor in the uniform group stays in ur: there the flip is
+# persistent in the UR cell, unlike the transient flip of the addr group.
+# Applied by ml/labels.py to the rows of logs/final-2026-11-05/dataset/runs.csv
+# (scripts/export_dataset.py).
+#
+# The label is ground truth: every column used here (injector, group, reg_class, opcode,
+# mem_mode, fault_model) is metadata, never an input feature.
+#
+# Rules are tried in order; the first match wins.
+
+version: 0
+
+rules:
+  # 1. Memory-data injector (mem_injector): data where it is stored.
+  - match: {injector: mem, group: global}       # modes a (between kernels) and b (atomicXor in L2 during a kernel)
+    label: mem_global
+  - match: {injector: mem, group: shared}       # modes u (uniform over SM x address x time) and s (right after a store)
+    label: mem_shared
+  # 2. Address registers at the moment of use, groups 13 (addr) and 14 (addr_store),
+  #    including the memory descriptor (addr_part = desc, a UR pair).
+  - match: {injector: reg, group: [addr, addr_store]}
+    label: addr
+  # 3. Non-GPR register files, whatever the opcode.
+  - match: {injector: reg, reg_class: PR}       # predicate registers, 1-bit per-thread flags
+    label: pr
+  - match: {injector: reg, reg_class: UR}       # uniform registers, one 32-bit value per warp
+    label: ur                                    # includes the memory descriptor (memory_descriptor = 1)
+  - match: {injector: reg, reg_class: UP}       # uniform predicates, one 1-bit flag per warp
+    label: up
+  # 4. GPR destinations (groups fp32, ld, tc, sfu, gp, ...): the unit that produced the value,
+  #    from the base opcode (text before the first '.'), not from the group.
+  - match: {injector: reg, reg_class: GPR}
+    label: from_opcode
+
+# Base SASS opcode -> class, for GPR destinations. "seen" = present in the current data
+# (visible runs or not); the others are listed so a new architecture (Orin, sm_87) maps
+# without edits where the unit is unambiguous. An opcode not listed here is reported as
+# unmapped by ml/labels.py and its rows get no label.
+opcode_classes:
+  fp32:       # FP32 pipeline of the SM (FMA unit)
+    seen:  [FFMA, FADD, FMUL, FMNMX]
+    other: [FFMA32I, FADD32I, FMUL32I, FSEL, FSET, FCHK, FSWZADD]
+  fp64:       # FP64 unit (few per SM on consumer GPUs)
+    seen:  []
+    other: [DFMA, DADD, DMUL]
+  fp16:       # packed half-precision operations on the FMA pipeline
+    seen:  [HFMA2]
+    other: [HADD2, HMUL2, HMNMX2, HSET2]
+  tc:         # Tensor Cores, matrix multiply-accumulate
+    seen:  [HMMA]
+    other: [IMMA, DMMA, QMMA, BMMA]
+  sfu:        # Special Function Unit (MUFU: rcp, rsqrt, sin, exp, log, ...)
+    seen:  [MUFU]
+    other: []
+  int:        # integer ALU / integer multiply-add
+    seen:  [IMAD, IADD3, IADD, LEA, LOP3, SHF, VIMNMX]
+    other: [IMNMX, IMUL, ISCADD, IABS, POPC, FLO, BREV, BMSK, SGXT, IDP, LOP, SHL, SHR, IMAD32I, LOP32I, IADD32I]
+  move:       # data movement and conversion, no arithmetic: register moves, special registers, byte permute, shuffles, conversions
+    seen:  [MOV, MOVM, PRMT, S2R, CS2R]
+    other: [MOV32I, SEL, SHFL, VOTE, F2I, I2F, F2F, I2I, F2FP, FRND, P2R]
+  ld_data:    # loads of data from global or shared memory (LSU, through L1/L2)
+    seen:  [LDG, LDS]
+    other: [LD, LDL, LDSM, ATOMG, ATOMS, ATOM]
+  ld_const:   # loads from constant memory (kernel parameters and constants, constant cache)
+    seen:  [LDC]
+    other: []
+
+classes:
+  # train: in the stage-1 training set. no_data: kept for completeness, too few or no runs.
+  fp32:       {train: true}
+  fp64:       {train: false, status: no_data, note: "no workload executes FP64 instructions"}
+  fp16:       {train: false, status: no_data, note: "HFMA2 only, 7 visible single-bit runs (cnn) + 4 MCU"}
+  tc:         {train: true, note: "gemm only"}
+  sfu:        {train: true, note: "sfu_math, plus MUFU sites of the gp group"}
+  int:        {train: true}
+  move:       {train: true, note: "kept separate; merge decided from the confusion matrix"}
+  ld_data:    {train: true}
+  ld_const:   {train: true, note: "LDC from both the ld and gp groups"}
+  pr:         {train: true, note: "mostly loop-control ISETP; cnn has none (uniform loops)"}
+  ur:         {train: true}
+  up:         {train: true, note: "gemm and cnn only, few runs"}
+  addr:       {train: true}
+  mem_global: {train: true, note: "shm_stencil and sfu_math added by block 5 part 1"}
+  mem_shared: {train: true, note: "shm_stencil only"}
+
+# Which runs enter stage 1.
+selection:
+  visible_outcomes: [sdc, crash, timeout]      # column outcome_class_for_rates
+  require: {valid_for_rates: 1}                # drops v1_up_invalid (19) and not_injected (2)
+  exclude:
+    - {campaign: final-v1, group: uniform}     # superseded by block 3 (re-run), no per-run outputs
+  # memory mode s (shared, right after a store) is included although for_avf = 0
+
+# Fault models: single bit -> training/CV; multi-cell (MCU) -> separate robustness test set.
+# Expected class of an MCU run = the class the same rules give (opcode of the target
+# instruction for registers, structure for memory): it is the single-bit class of that site.
+splits:
+  train: {fault_model: [single_bit]}
+  mcu_test: {fault_model: [adj_bits, adj_regs, adj_lanes, adj_words]}
